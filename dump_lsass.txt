@@ -1,0 +1,17 @@
+* Quy trình:
+** Tìm pid của tiến trình lsass.exe
+*** CreateToolhelp32Snapshot: snapshot lại tất cả process đang chạy.
+*** Process32FirstW, Process32NextW: duyệt qua các tiến trình để tìm kiếm.
+==> Ở đây cần lấy ra PID vì mọi thao tác với process trong Windows đều dùng PID, OpenProcess và miniDumpWriteDump đều cần PID.
+** Bật quyền SeDebugPrivilege cho tiến trình hiện tại
+*** Nếu không có quyền này thì không thể mở được tiến trình lsass.exe (ngoại trừ khi có lsa protection)
+*** GetCurrentProcess, OpenProcessToken: Lấy danh sách quyền của tiến trình hiện tại.
+*** LookupPrivilegeValueW: Windows quản lý privilege bằng LUID, không dùng string trực tiếp.
+*** AdjustTokenPrivileges: Điều chỉnh quyền. Thêm quyền SeDebugPrivilege bằng cách gắn cờ SE_PRIVILEGE_ENABLED.
+
+Luồng:
+1. Bật SeDebugPrivilege
+2. Tìm PID lsass.exe
+3. Mở handle tới lsass.exe
+4. Tạo file dump (File này sẽ chứa snapshot bộ nhớ của lsass tại thời điểm dump)
+5. Dump bộ nhớ bằng MiniDumpWriteDump
