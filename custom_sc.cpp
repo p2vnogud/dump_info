@@ -1,457 +1,527 @@
-﻿#include <windows.h>
+﻿/*
+ * remote_service_manager.cpp
+ *
+ * Quản lý service từ xa qua SMB/IPC$ + SCM (Service Control Manager)
+ * Chỉ dùng WinAPI thuần
+ *
+ * Build:
+ *   cl remote_service_manager.cpp /W3 /O2 /EHsc /link netapi32.lib advapi32.lib mpr.lib
+ *
+ * Usage:
+ *   remote_service_manager.exe --host <IP/Hostname> --user <username> --pass <password>
+ *                              --service <ServiceName> --binpath <"C:\path\to\exe">
+ *                              --action <create|start|stop|delete|status|query>
+ *                              [--domain <domain>]
+ *
+ * Examples:
+ *   remote_service_manager.exe --host 192.168.47.136 --user Administrator --pass P@ssw0rd123
+ *                              --service FakeService --binpath "C:\Users\wintest\Desktop\service.exe"
+ *                              --action create
+ *
+ *   remote_service_manager.exe --host 192.168.47.136 --user Administrator --pass P@ssw0rd123
+ *                              --service FakeService --action start
+ *
+ *   remote_service_manager.exe --host 192.168.47.136 --user Administrator --pass P@ssw0rd123
+ *                              --service FakeService --action stop
+ *
+ *   remote_service_manager.exe --host 192.168.47.136 --user Administrator --pass P@ssw0rd123
+ *                              --service FakeService --action delete
+ *
+ *   remote_service_manager.exe --host 192.168.47.136 --user Administrator --pass P@ssw0rd123
+ *                              --service FakeService --action status
+ */
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <winsvc.h>
+#include <winnetwk.h>
+#include <lm.h>
+#include <tchar.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
- // ============================================================
- // Hàm trợ giúp: In lỗi WinAPI
- // ============================================================
-void PrintLastError(const char* context) {
-    DWORD err = GetLastError();
-    LPSTR msg = NULL;
-    FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "mpr.lib")
+#pragma comment(lib, "netapi32.lib")
+
+ // ---------------------------------------------------------------------------
+ // Cấu trúc tham số
+ // ---------------------------------------------------------------------------
+struct Config {
+    WCHAR host[256];
+    WCHAR user[256];
+    WCHAR pass[256];
+    WCHAR domain[256];
+    WCHAR serviceName[256];
+    WCHAR binPath[1024];
+    WCHAR action[64];          // create | start | stop | delete | status | query
+    WCHAR startType[32];       // auto | manual | disabled  (default: auto)
+};
+
+// ---------------------------------------------------------------------------
+// Hàm in lỗi Win32
+// ---------------------------------------------------------------------------
+static void PrintWin32Error(const wchar_t* msg, DWORD err)
+{
+    LPWSTR buf = NULL;
+    FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM
+        | FORMAT_MESSAGE_IGNORE_INSERTS,
         NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        (LPSTR)&msg, 0, NULL
-    );
-    printf("[LỖI] %s - Mã lỗi: %lu - %s", context, err, msg ? msg : "Không rõ\n");
-    if (msg) LocalFree(msg);
+        (LPWSTR)&buf, 0, NULL);
+    wprintf(L"[-] %s (Error %lu): %s\n", msg, err, buf ? buf : L"Unknown error");
+    if (buf) LocalFree(buf);
 }
 
-// ============================================================
-// Mở Service Control Manager
-// ============================================================
-SC_HANDLE OpenSCM(DWORD desiredAccess) {
-    SC_HANDLE hSCM = OpenSCManagerA(NULL, NULL, desiredAccess);
-    if (!hSCM) {
-        PrintLastError("OpenSCManager");
+// ---------------------------------------------------------------------------
+// Kiểm tra session IPC$ đến host đã tồn tại chưa
+// Cách: thử NetSessionEnum hoặc WNetGetConnection hoặc đơn giản
+// thử OpenSCManager - nếu thành công nghĩa là đã có xác thực
+//
+// Trả về TRUE nếu đã có session xác thực
+// ---------------------------------------------------------------------------
+static BOOL IsSessionEstablished(const WCHAR* host)
+{
+    // Thử kết nối SCM không cần thêm credential
+    // Nếu thành công → đã có session / credential được cache
+    WCHAR unc[300];
+    swprintf_s(unc, 300, L"\\\\%s", host);
+
+    SC_HANDLE hScm = OpenSCManagerW(unc, NULL, SC_MANAGER_CONNECT);
+    if (hScm) {
+        CloseServiceHandle(hScm);
+        wprintf(L"[*] Session/auth to %s already established.\n", host);
+        return TRUE;
     }
-    return hSCM;
+    // Nếu lỗi ACCESS_DENIED hoặc logon failure → chưa có session hợp lệ
+    return FALSE;
 }
 
-// ============================================================
-// 1. Tạo Service (sc create)
-// ============================================================
-void CreateService_Cmd(int argc, char* argv[]) {
-    // Usage: ServiceManager create <ServiceName> <BinaryPath> [DisplayName] [StartType]
-    if (argc < 5) {
-        printf("Cách dùng: ServiceManager create <TênService> <ĐườngDẫnExe> [TênHiển] [auto|demand|disabled]\n");
-        printf("Ví dụ: ServiceManager create MyService \"C:\\path\\my.exe\" \"My Service\" auto\n");
-        return;
+// ---------------------------------------------------------------------------
+// Tạo IPC$ session (net use \\host\IPC$ /user:domain\user pass)
+// Dùng WNetAddConnection2W
+// ---------------------------------------------------------------------------
+static BOOL EstablishSession(const Config& cfg)
+{
+    if (IsSessionEstablished(cfg.host)) return TRUE;
+
+    WCHAR remoteName[512];
+    swprintf_s(remoteName, 512, L"\\\\%s\\IPC$", cfg.host);
+
+    // Xây dựng username: domain\user hoặc chỉ user
+    WCHAR fullUser[512];
+    if (cfg.domain[0])
+        swprintf_s(fullUser, 512, L"%s\\%s", cfg.domain, cfg.user);
+    else
+        wcscpy_s(fullUser, 512, cfg.user);
+
+    NETRESOURCEW nr = {};
+    nr.dwType = RESOURCETYPE_ANY;
+    nr.lpRemoteName = remoteName;
+    nr.lpLocalName = NULL;   // không map drive letter
+    nr.lpProvider = NULL;
+
+    wprintf(L"[*] Establishing IPC$ session to %s as %s ...\n", remoteName, fullUser);
+
+    DWORD ret = WNetAddConnection2W(&nr, cfg.pass, fullUser,
+        CONNECT_TEMPORARY);  // không lưu vào profile
+
+    if (ret == NO_ERROR || ret == ERROR_ALREADY_ASSIGNED || ret == ERROR_SESSION_CREDENTIAL_CONFLICT) {
+        wprintf(L"[+] Session established (or already existed).\n");
+        return TRUE;
     }
 
-    const char* serviceName = argv[2];
-    const char* binaryPath = argv[3];
-    const char* displayName = (argc > 4) ? argv[4] : serviceName;
-    DWORD startType = SERVICE_DEMAND_START; // mặc định là manual
-
-    if (argc > 5) {
-        if (_stricmp(argv[5], "auto") == 0)         startType = SERVICE_AUTO_START;
-        else if (_stricmp(argv[5], "disabled") == 0) startType = SERVICE_DISABLED;
-        else                                         startType = SERVICE_DEMAND_START;
-    }
-
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_CREATE_SERVICE);
-    if (!hSCM) return;
-
-    SC_HANDLE hService = CreateServiceA(
-        hSCM,
-        serviceName,              // Tên nội bộ
-        displayName,              // Tên hiển thị
-        SERVICE_ALL_ACCESS,       // Quyền truy cập
-        SERVICE_WIN32_OWN_PROCESS,// Loại service
-        startType,                // Kiểu khởi động
-        SERVICE_ERROR_NORMAL,     // Xử lý lỗi
-        binaryPath,               // Đường dẫn file exe
-        NULL,                     // Load order group
-        NULL,                     // Tag ID
-        NULL,                     // Dependencies
-        NULL,                     // Tài khoản chạy (NULL = LocalSystem)
-        NULL                      // Mật khẩu
-    );
-
-    if (hService) {
-        printf("[OK] Tạo service '%s' thành công!\n", serviceName);
-        printf("     DisplayName : %s\n", displayName);
-        printf("     BinaryPath  : %s\n", binaryPath);
-        printf("     StartType   : %s\n", (startType == SERVICE_AUTO_START) ? "Automatic" :
-            (startType == SERVICE_DISABLED) ? "Disabled" : "Manual");
-        CloseServiceHandle(hService);
-    }
-    else {
-        PrintLastError("CreateService");
-    }
-
-    CloseServiceHandle(hSCM);
-}
-
-// ============================================================
-// 2. Xóa Service (sc delete)
-// ============================================================
-void DeleteService_Cmd(int argc, char* argv[]) {
-    if (argc < 3) {
-        printf("Cách dùng: ServiceManager delete <TênService>\n");
-        return;
-    }
-    const char* serviceName = argv[2];
-
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_ALL_ACCESS);
-    if (!hSCM) return;
-
-    SC_HANDLE hService = OpenServiceA(hSCM, serviceName, DELETE);
-    if (!hService) {
-        PrintLastError("OpenService");
-        CloseServiceHandle(hSCM);
-        return;
-    }
-
-    if (DeleteService(hService)) {
-        printf("[OK] Đã đánh dấu xóa service '%s'. Service sẽ bị xóa sau khi dừng hoàn toàn.\n", serviceName);
-    }
-    else {
-        PrintLastError("DeleteService");
-    }
-
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
-}
-
-// ============================================================
-// 3. Khởi động Service (sc start)
-// ============================================================
-void StartService_Cmd(int argc, char* argv[]) {
-    if (argc < 3) {
-        printf("Cách dùng: ServiceManager start <TênService>\n");
-        return;
-    }
-    const char* serviceName = argv[2];
-
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_CONNECT);
-    if (!hSCM) return;
-
-    SC_HANDLE hService = OpenServiceA(hSCM, serviceName, SERVICE_START | SERVICE_QUERY_STATUS);
-    if (!hService) {
-        PrintLastError("OpenService");
-        CloseServiceHandle(hSCM);
-        return;
-    }
-
-    if (StartServiceA(hService, 0, NULL)) {
-        printf("[OK] Đang khởi động service '%s'...\n", serviceName);
-
-        // Chờ service chạy xong (tối đa 30 giây)
-        SERVICE_STATUS_PROCESS ssp;
-        DWORD bytesNeeded;
-        DWORD startTick = GetTickCount();
-
-        while (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
-            (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded))
-        {
-            if (ssp.dwCurrentState == SERVICE_RUNNING) {
-                printf("[OK] Service '%s' đã chạy! PID: %lu\n", serviceName, ssp.dwProcessId);
-                break;
-            }
-            if (GetTickCount() - startTick > 30000) {
-                printf("[CẢNH BÁO] Timeout chờ service khởi động.\n");
-                break;
-            }
-            Sleep(500);
+    // ERROR_SESSION_CREDENTIAL_CONFLICT: đã có session với credential khác
+    // → cần disconnect trước
+    if (ret == ERROR_SESSION_CREDENTIAL_CONFLICT) {
+        wprintf(L"[!] Credential conflict. Disconnecting old session...\n");
+        WNetCancelConnection2W(remoteName, 0, TRUE);
+        ret = WNetAddConnection2W(&nr, cfg.pass, fullUser, CONNECT_TEMPORARY);
+        if (ret == NO_ERROR) {
+            wprintf(L"[+] Session established after reconnect.\n");
+            return TRUE;
         }
     }
-    else {
-        PrintLastError("StartService");
-    }
 
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
+    PrintWin32Error(L"WNetAddConnection2 failed", ret);
+    return FALSE;
 }
 
-// ============================================================
-// 4. Dừng Service (sc stop)
-// ============================================================
-void StopService_Cmd(int argc, char* argv[]) {
-    if (argc < 3) {
-        printf("Cách dùng: ServiceManager stop <TênService>\n");
-        return;
-    }
-    const char* serviceName = argv[2];
+// ---------------------------------------------------------------------------
+// Mở SCManager remote
+// ---------------------------------------------------------------------------
+static SC_HANDLE OpenRemoteSCM(const WCHAR* host, DWORD desiredAccess)
+{
+    WCHAR unc[300];
+    swprintf_s(unc, 300, L"\\\\%s", host);
 
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_CONNECT);
-    if (!hSCM) return;
-
-    SC_HANDLE hService = OpenServiceA(hSCM, serviceName, SERVICE_STOP | SERVICE_QUERY_STATUS);
-    if (!hService) {
-        PrintLastError("OpenService");
-        CloseServiceHandle(hSCM);
-        return;
-    }
-
-    SERVICE_STATUS ss;
-    if (ControlService(hService, SERVICE_CONTROL_STOP, &ss)) {
-        printf("[OK] Đang dừng service '%s'...\n", serviceName);
-
-        // Chờ dừng hoàn toàn
-        DWORD startTick = GetTickCount();
-        while (ss.dwCurrentState != SERVICE_STOPPED) {
-            Sleep(500);
-            if (!QueryServiceStatus(hService, &ss)) break;
-            if (GetTickCount() - startTick > 30000) {
-                printf("[CẢNH BÁO] Timeout chờ service dừng.\n");
-                break;
-            }
-        }
-        if (ss.dwCurrentState == SERVICE_STOPPED)
-            printf("[OK] Service '%s' đã dừng.\n", serviceName);
-    }
-    else {
-        PrintLastError("ControlService (STOP)");
-    }
-
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
+    SC_HANDLE hScm = OpenSCManagerW(unc, NULL, desiredAccess);
+    if (!hScm)
+        PrintWin32Error(L"OpenSCManagerW failed", GetLastError());
+    return hScm;
 }
 
-// ============================================================
-// 5. Xem trạng thái Service (sc query)
-// ============================================================
-void QueryService_Cmd(int argc, char* argv[]) {
-    if (argc < 3) {
-        printf("Cách dùng: ServiceManager query <TênService>\n");
-        return;
+// ---------------------------------------------------------------------------
+// ACTION: Create service
+// ---------------------------------------------------------------------------
+static BOOL ActionCreate(const Config& cfg)
+{
+    wprintf(L"[*] Creating service '%s' on %s ...\n", cfg.serviceName, cfg.host);
+    wprintf(L"    BinPath : %s\n", cfg.binPath);
+
+    SC_HANDLE hScm = OpenRemoteSCM(cfg.host,
+        SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT);
+    if (!hScm) return FALSE;
+
+    DWORD startType = SERVICE_AUTO_START;
+    if (_wcsicmp(cfg.startType, L"manual") == 0)
+        startType = SERVICE_DEMAND_START;
+    else if (_wcsicmp(cfg.startType, L"disabled") == 0)
+        startType = SERVICE_DISABLED;
+
+    SC_HANDLE hSvc = CreateServiceW(
+        hScm,
+        cfg.serviceName,            // tên service (internal)
+        cfg.serviceName,            // display name
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        startType,
+        SERVICE_ERROR_NORMAL,
+        cfg.binPath,
+        NULL, NULL, NULL,
+        NULL,                       // LocalSystem account
+        NULL
+    );
+
+    if (!hSvc) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_EXISTS)
+            wprintf(L"[!] Service already exists.\n");
+        else
+            PrintWin32Error(L"CreateServiceW failed", err);
+        CloseServiceHandle(hScm);
+        return FALSE;
     }
-    const char* serviceName = argv[2];
 
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_CONNECT);
-    if (!hSCM) return;
+    wprintf(L"[+] Service '%s' created successfully.\n", cfg.serviceName);
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+    return TRUE;
+}
 
-    SC_HANDLE hService = OpenServiceA(hSCM, serviceName,
+// ---------------------------------------------------------------------------
+// ACTION: Start service
+// ---------------------------------------------------------------------------
+static BOOL ActionStart(const Config& cfg)
+{
+    wprintf(L"[*] Starting service '%s' on %s ...\n", cfg.serviceName, cfg.host);
+
+    SC_HANDLE hScm = OpenRemoteSCM(cfg.host, SC_MANAGER_CONNECT);
+    if (!hScm) return FALSE;
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, cfg.serviceName,
+        SERVICE_START | SERVICE_QUERY_STATUS);
+    if (!hSvc) {
+        PrintWin32Error(L"OpenServiceW failed", GetLastError());
+        CloseServiceHandle(hScm);
+        return FALSE;
+    }
+
+    // Kiểm tra trạng thái trước
+    SERVICE_STATUS ss = {};
+    QueryServiceStatus(hSvc, &ss);
+    if (ss.dwCurrentState == SERVICE_RUNNING) {
+        wprintf(L"[!] Service is already running.\n");
+        CloseServiceHandle(hSvc);
+        CloseServiceHandle(hScm);
+        return TRUE;
+    }
+
+    if (!StartServiceW(hSvc, 0, NULL)) {
+        PrintWin32Error(L"StartServiceW failed", GetLastError());
+        CloseServiceHandle(hSvc);
+        CloseServiceHandle(hScm);
+        return FALSE;
+    }
+
+    // Chờ service start
+    wprintf(L"[*] Waiting for service to start");
+    DWORD timeout = 30000, waited = 0, interval = 500;
+    while (waited < timeout) {
+        Sleep(interval);
+        waited += interval;
+        QueryServiceStatus(hSvc, &ss);
+        wprintf(L".");
+        if (ss.dwCurrentState == SERVICE_RUNNING) break;
+        if (ss.dwCurrentState == SERVICE_STOPPED) break;
+    }
+    wprintf(L"\n");
+
+    if (ss.dwCurrentState == SERVICE_RUNNING)
+        wprintf(L"[+] Service '%s' started successfully.\n", cfg.serviceName);
+    else
+        wprintf(L"[-] Service did not reach RUNNING state (state=%lu).\n",
+            ss.dwCurrentState);
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+    return (ss.dwCurrentState == SERVICE_RUNNING);
+}
+
+// ---------------------------------------------------------------------------
+// ACTION: Stop service
+// ---------------------------------------------------------------------------
+static BOOL ActionStop(const Config& cfg)
+{
+    wprintf(L"[*] Stopping service '%s' on %s ...\n", cfg.serviceName, cfg.host);
+
+    SC_HANDLE hScm = OpenRemoteSCM(cfg.host, SC_MANAGER_CONNECT);
+    if (!hScm) return FALSE;
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, cfg.serviceName,
+        SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (!hSvc) {
+        PrintWin32Error(L"OpenServiceW failed", GetLastError());
+        CloseServiceHandle(hScm);
+        return FALSE;
+    }
+
+    SERVICE_STATUS ss = {};
+    if (!ControlService(hSvc, SERVICE_CONTROL_STOP, &ss)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_NOT_ACTIVE)
+            wprintf(L"[!] Service is not running.\n");
+        else
+            PrintWin32Error(L"ControlService(STOP) failed", err);
+        CloseServiceHandle(hSvc);
+        CloseServiceHandle(hScm);
+        return FALSE;
+    }
+
+    wprintf(L"[*] Waiting for service to stop");
+    DWORD timeout = 30000, waited = 0, interval = 500;
+    while (waited < timeout) {
+        Sleep(interval);
+        waited += interval;
+        QueryServiceStatus(hSvc, &ss);
+        wprintf(L".");
+        if (ss.dwCurrentState == SERVICE_STOPPED) break;
+    }
+    wprintf(L"\n");
+
+    if (ss.dwCurrentState == SERVICE_STOPPED)
+        wprintf(L"[+] Service '%s' stopped.\n", cfg.serviceName);
+    else
+        wprintf(L"[-] Service did not stop (state=%lu).\n", ss.dwCurrentState);
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+    return (ss.dwCurrentState == SERVICE_STOPPED);
+}
+
+// ---------------------------------------------------------------------------
+// ACTION: Delete service
+// ---------------------------------------------------------------------------
+static BOOL ActionDelete(const Config& cfg)
+{
+    wprintf(L"[*] Deleting service '%s' on %s ...\n", cfg.serviceName, cfg.host);
+
+    SC_HANDLE hScm = OpenRemoteSCM(cfg.host, SC_MANAGER_CONNECT);
+    if (!hScm) return FALSE;
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, cfg.serviceName, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (!hSvc) {
+        PrintWin32Error(L"OpenServiceW failed", GetLastError());
+        CloseServiceHandle(hScm);
+        return FALSE;
+    }
+
+    // Dừng trước nếu đang chạy
+    SERVICE_STATUS ss = {};
+    QueryServiceStatus(hSvc, &ss);
+    if (ss.dwCurrentState != SERVICE_STOPPED) {
+        wprintf(L"[*] Service is running. Stopping first...\n");
+        ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);
+        Sleep(2000);
+    }
+
+    BOOL ok = DeleteService(hSvc);
+    if (!ok)
+        PrintWin32Error(L"DeleteService failed", GetLastError());
+    else
+        wprintf(L"[+] Service '%s' deleted.\n", cfg.serviceName);
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// ACTION: Query / Status
+// ---------------------------------------------------------------------------
+static BOOL ActionStatus(const Config& cfg)
+{
+    wprintf(L"[*] Querying service '%s' on %s ...\n", cfg.serviceName, cfg.host);
+
+    SC_HANDLE hScm = OpenRemoteSCM(cfg.host, SC_MANAGER_CONNECT);
+    if (!hScm) return FALSE;
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, cfg.serviceName,
         SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG);
-    if (!hService) {
-        PrintLastError("OpenService");
-        CloseServiceHandle(hSCM);
-        return;
+    if (!hSvc) {
+        PrintWin32Error(L"OpenServiceW failed", GetLastError());
+        CloseServiceHandle(hScm);
+        return FALSE;
     }
 
-    // Lấy trạng thái
-    SERVICE_STATUS_PROCESS ssp;
-    DWORD bytesNeeded;
-    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
-        (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded))
-    {
-        const char* stateStr;
-        switch (ssp.dwCurrentState) {
-        case SERVICE_STOPPED:          stateStr = "STOPPED";          break;
-        case SERVICE_START_PENDING:    stateStr = "START_PENDING";    break;
-        case SERVICE_STOP_PENDING:     stateStr = "STOP_PENDING";     break;
-        case SERVICE_RUNNING:          stateStr = "RUNNING";          break;
-        case SERVICE_CONTINUE_PENDING: stateStr = "CONTINUE_PENDING"; break;
-        case SERVICE_PAUSE_PENDING:    stateStr = "PAUSE_PENDING";    break;
-        case SERVICE_PAUSED:           stateStr = "PAUSED";           break;
-        default:                       stateStr = "UNKNOWN";          break;
+    // Status
+    SERVICE_STATUS_PROCESS ssp = {};
+    DWORD needed = 0;
+    QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+        (LPBYTE)&ssp, sizeof(ssp), &needed);
+
+    auto StateStr = [](DWORD s) -> const wchar_t* {
+        switch (s) {
+        case SERVICE_STOPPED:          return L"STOPPED";
+        case SERVICE_START_PENDING:    return L"START_PENDING";
+        case SERVICE_STOP_PENDING:     return L"STOP_PENDING";
+        case SERVICE_RUNNING:          return L"RUNNING";
+        case SERVICE_CONTINUE_PENDING: return L"CONTINUE_PENDING";
+        case SERVICE_PAUSE_PENDING:    return L"PAUSE_PENDING";
+        case SERVICE_PAUSED:           return L"PAUSED";
+        default:                       return L"UNKNOWN";
         }
-        printf("\n[TRẠNG THÁI SERVICE]\n");
-        printf("  Tên Service  : %s\n", serviceName);
-        printf("  Trạng thái  : %s\n", stateStr);
-        printf("  PID          : %lu\n", ssp.dwProcessId);
-    }
-    else {
-        PrintLastError("QueryServiceStatusEx");
-    }
+        };
 
-    // Lấy cấu hình
-    DWORD configSize = 0;
-    QueryServiceConfigA(hService, NULL, 0, &configSize);
-    if (configSize > 0) {
-        LPQUERY_SERVICE_CONFIGA pConfig = (LPQUERY_SERVICE_CONFIGA)malloc(configSize);
-        if (QueryServiceConfigA(hService, pConfig, configSize, &configSize)) {
-            const char* startStr;
-            switch (pConfig->dwStartType) {
-            case SERVICE_AUTO_START:   startStr = "Auto";     break;
-            case SERVICE_DEMAND_START: startStr = "Manual";   break;
-            case SERVICE_DISABLED:     startStr = "Disabled"; break;
-            default:                   startStr = "Unknown";  break;
-            }
-            printf("  Kiểu khởi động: %s\n", startStr);
-            printf("  Đường dẫn EXE: %s\n", pConfig->lpBinaryPathName);
-            printf("  Display Name : %s\n", pConfig->lpDisplayName);
+    wprintf(L"\n  Service Name : %s\n", cfg.serviceName);
+    wprintf(L"  State        : %s (%lu)\n", StateStr(ssp.dwCurrentState), ssp.dwCurrentState);
+    wprintf(L"  PID          : %lu\n", ssp.dwProcessId);
+
+    // Config
+    DWORD cbNeeded = 0;
+    QueryServiceConfigW(hSvc, NULL, 0, &cbNeeded);
+    if (cbNeeded > 0) {
+        LPQUERY_SERVICE_CONFIGW pCfg = (LPQUERY_SERVICE_CONFIGW)HeapAlloc(
+            GetProcessHeap(), 0, cbNeeded);
+        if (pCfg && QueryServiceConfigW(hSvc, pCfg, cbNeeded, &cbNeeded)) {
+            auto StartStr = [](DWORD t) -> const wchar_t* {
+                switch (t) {
+                case SERVICE_AUTO_START:   return L"AUTO_START";
+                case SERVICE_DEMAND_START: return L"DEMAND_START";
+                case SERVICE_DISABLED:     return L"DISABLED";
+                case SERVICE_BOOT_START:   return L"BOOT_START";
+                case SERVICE_SYSTEM_START: return L"SYSTEM_START";
+                default:                   return L"UNKNOWN";
+                }
+                };
+            wprintf(L"  Start Type   : %s\n", StartStr(pCfg->dwStartType));
+            wprintf(L"  Binary Path  : %s\n", pCfg->lpBinaryPathName);
+            wprintf(L"  Display Name : %s\n", pCfg->lpDisplayName);
         }
-        free(pConfig);
+        if (pCfg) HeapFree(GetProcessHeap(), 0, pCfg);
     }
+    wprintf(L"\n");
 
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hScm);
+    return TRUE;
 }
 
-// ============================================================
-// 6. Liệt kê tất cả Services (sc query type= all)
-// ============================================================
-void ListServices_Cmd() {
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_ENUMERATE_SERVICE);
-    if (!hSCM) return;
-
-    DWORD bytesNeeded = 0, numServices = 0, resumeHandle = 0;
-
-    // Gọi lần đầu để lấy kích thước buffer cần thiết
-    EnumServicesStatusExA(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_WIN32,
-        SERVICE_STATE_ALL, NULL, 0, &bytesNeeded, &numServices, &resumeHandle, NULL);
-
-    LPBYTE buffer = (LPBYTE)malloc(bytesNeeded);
-    if (!buffer) { CloseServiceHandle(hSCM); return; }
-
-    resumeHandle = 0;
-    if (EnumServicesStatusExA(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_WIN32,
-        SERVICE_STATE_ALL, buffer, bytesNeeded, &bytesNeeded,
-        &numServices, &resumeHandle, NULL))
-    {
-        LPENUM_SERVICE_STATUS_PROCESSA services = (LPENUM_SERVICE_STATUS_PROCESSA)buffer;
-
-        printf("\n%-40s %-12s %s\n", "TÊN SERVICE", "TRẠNG THÁI", "DISPLAY NAME");
-        printf("%-40s %-12s %s\n",
-            "----------------------------------------",
-            "------------",
-            "-------------------------------------------------------");
-
-        for (DWORD i = 0; i < numServices; i++) {
-            const char* stateStr;
-            switch (services[i].ServiceStatusProcess.dwCurrentState) {
-            case SERVICE_RUNNING: stateStr = "RUNNING";  break;
-            case SERVICE_STOPPED: stateStr = "STOPPED";  break;
-            case SERVICE_PAUSED:  stateStr = "PAUSED";   break;
-            default:              stateStr = "PENDING";  break;
-            }
-            printf("%-40s %-12s %s\n",
-                services[i].lpServiceName,
-                stateStr,
-                services[i].lpDisplayName);
-        }
-        printf("\nTổng cộng: %lu service(s)\n", numServices);
-    }
-    else {
-        PrintLastError("EnumServicesStatusEx");
-    }
-
-    free(buffer);
-    CloseServiceHandle(hSCM);
+// ---------------------------------------------------------------------------
+// Parse command-line (wide)
+// ---------------------------------------------------------------------------
+static void Usage(const wchar_t* prog)
+{
+    wprintf(L"\nUsage:\n");
+    wprintf(L"  %s --host <IP/Host> --user <user> --pass <pass>\n", prog);
+    wprintf(L"           --service <Name> --action <create|start|stop|delete|status>\n");
+    wprintf(L"           [--binpath <path>]    (required for create)\n");
+    wprintf(L"           [--domain <domain>]   (optional, default: empty)\n");
+    wprintf(L"           [--starttype <auto|manual|disabled>]  (default: auto)\n");
+    wprintf(L"\nActions:\n");
+    wprintf(L"  create  - Create service (requires --binpath)\n");
+    wprintf(L"  start   - Start service\n");
+    wprintf(L"  stop    - Stop service\n");
+    wprintf(L"  delete  - Delete service (stops first if running)\n");
+    wprintf(L"  status  - Query service status and config\n");
+    wprintf(L"\nExamples:\n");
+    wprintf(L"  %s --host 192.168.47.136 --user Administrator --pass P@ssw0rd123\n"
+        L"       --service FakeService --binpath \"C:\\Users\\wintest\\Desktop\\service.exe\"\n"
+        L"       --action create\n\n", prog);
 }
 
-// ============================================================
-// 7. Thay đổi cấu hình Service (sc config)
-// ============================================================
-void ConfigService_Cmd(int argc, char* argv[]) {
-    // Usage: ServiceManager config <ServiceName> [start=auto|demand|disabled] [binpath=<path>] [displayname=<name>]
-    if (argc < 4) {
-        printf("Cách dùng: ServiceManager config <TênService> [start=auto|demand|disabled] [binpath=<đường_dẫn>]\n");
-        printf("Ví dụ: ServiceManager config MyService start=auto\n");
-        return;
-    }
-    const char* serviceName = argv[2];
+static bool ParseArgs(int argc, wchar_t** argv, Config& cfg)
+{
+    memset(&cfg, 0, sizeof(cfg));
+    wcscpy_s(cfg.startType, L"auto"); // default
 
-    SC_HANDLE hSCM = OpenSCM(SC_MANAGER_CONNECT);
-    if (!hSCM) return;
-
-    SC_HANDLE hService = OpenServiceA(hSCM, serviceName, SERVICE_CHANGE_CONFIG);
-    if (!hService) {
-        PrintLastError("OpenService");
-        CloseServiceHandle(hSCM);
-        return;
-    }
-
-    DWORD startType = SERVICE_NO_CHANGE;
-    const char* binPath = NULL;
-    const char* dispName = NULL;
-
-    for (int i = 3; i < argc; i++) {
-        if (_strnicmp(argv[i], "start=", 6) == 0) {
-            const char* val = argv[i] + 6;
-            if (_stricmp(val, "auto") == 0)         startType = SERVICE_AUTO_START;
-            else if (_stricmp(val, "demand") == 0)  startType = SERVICE_DEMAND_START;
-            else if (_stricmp(val, "disabled") == 0) startType = SERVICE_DISABLED;
-        }
-        else if (_strnicmp(argv[i], "binpath=", 8) == 0) {
-            binPath = argv[i] + 8;
-        }
-        else if (_strnicmp(argv[i], "displayname=", 12) == 0) {
-            dispName = argv[i] + 12;
-        }
+    for (int i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"--host") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.host, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--user") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.user, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--pass") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.pass, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--domain") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.domain, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--service") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.serviceName, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--binpath") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.binPath, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--action") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.action, argv[++i]);
+        else if (_wcsicmp(argv[i], L"--starttype") == 0 && i + 1 < argc)
+            wcscpy_s(cfg.startType, argv[++i]);
     }
 
-    if (ChangeServiceConfigA(
-        hService,
-        SERVICE_NO_CHANGE,  // ServiceType
-        startType,          // StartType
-        SERVICE_NO_CHANGE,  // ErrorControl
-        binPath,            // BinaryPathName
-        NULL,               // LoadOrderGroup
-        NULL,               // TagId
-        NULL,               // Dependencies
-        NULL,               // ServiceStartName
-        NULL,               // Password
-        dispName            // DisplayName
-    )) {
-        printf("[OK] Đã cập nhật cấu hình service '%s'.\n", serviceName);
+    if (!cfg.host[0] || !cfg.user[0] || !cfg.action[0] || !cfg.serviceName[0]) {
+        wprintf(L"[-] Missing required parameters.\n");
+        return false;
     }
-    else {
-        PrintLastError("ChangeServiceConfig");
+    if (_wcsicmp(cfg.action, L"create") == 0 && !cfg.binPath[0]) {
+        wprintf(L"[-] --binpath is required for 'create' action.\n");
+        return false;
     }
-
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
+    return true;
 }
 
-// ============================================================
-// In hướng dẫn sử dụng
-// ============================================================
-void PrintUsage(const char* progName) {
-    printf("\n╔══════════════════════════════════════════════════════════╗\n");
-    printf("║         WINDOWS SERVICE MANAGER (WinAPI)                 ║\n");
-    printf("║         Tương đương sc.exe - Viết bằng C++ & WinAPI      ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n\n");
-    printf("Cách dùng: %s <lệnh> [tùy chọn]\n\n", progName);
-    printf("Các lệnh:\n");
-    printf("  create  <tên> <binpath> [displayname] [auto|demand|disabled]\n");
-    printf("          Tạo service mới\n\n");
-    printf("  delete  <tên>\n");
-    printf("          Xóa service\n\n");
-    printf("  start   <tên>\n");
-    printf("          Khởi động service\n\n");
-    printf("  stop    <tên>\n");
-    printf("          Dừng service\n\n");
-    printf("  query   <tên>\n");
-    printf("          Xem trạng thái và cấu hình service\n\n");
-    printf("  list\n");
-    printf("          Liệt kê tất cả services\n\n");
-    printf("  config  <tên> [start=auto|demand|disabled] [binpath=<đường_dẫn>]\n");
-    printf("          Thay đổi cấu hình service\n\n");
-    printf("Ghi chú: Cần chạy với quyền Administrator!\n\n");
-}
+// ---------------------------------------------------------------------------
+// Entry point (wmain for Unicode)
+// ---------------------------------------------------------------------------
+int wmain(int argc, wchar_t** argv)
+{
+    wprintf(L"=== Remote Service Manager (WinAPI) ===\n\n");
 
-// ============================================================
-// MAIN
-// ============================================================
-int main(int argc, char* argv[]) {
-    // Set console output to UTF-8 (cho tiếng Việt)
-    SetConsoleOutputCP(65001);
-
-    if (argc < 2) {
-        PrintUsage(argv[0]);
+    Config cfg;
+    if (!ParseArgs(argc, argv, cfg)) {
+        Usage(argv[0]);
         return 1;
     }
 
-    const char* command = argv[1];
-
-    if (_stricmp(command, "create") == 0) { CreateService_Cmd(argc, argv); }
-    else if (_stricmp(command, "delete") == 0) { DeleteService_Cmd(argc, argv); }
-    else if (_stricmp(command, "start") == 0) { StartService_Cmd(argc, argv); }
-    else if (_stricmp(command, "stop") == 0) { StopService_Cmd(argc, argv); }
-    else if (_stricmp(command, "query") == 0) { QueryService_Cmd(argc, argv); }
-    else if (_stricmp(command, "list") == 0) { ListServices_Cmd(); }
-    else if (_stricmp(command, "config") == 0) { ConfigService_Cmd(argc, argv); }
-    else {
-        printf("[LỖI] Lệnh không hợp lệ: '%s'\n", command);
-        PrintUsage(argv[0]);
-        return 1;
+    // --- Bước 1: Đảm bảo có session SMB/IPC$ xác thực ---
+    if (!EstablishSession(cfg)) {
+        wprintf(L"[-] Failed to establish authenticated session. Aborting.\n");
+        return 2;
     }
 
-    return 0;
+    // --- Bước 2: Thực hiện action ---
+    BOOL result = FALSE;
+
+    if (_wcsicmp(cfg.action, L"create") == 0)
+        result = ActionCreate(cfg);
+    else if (_wcsicmp(cfg.action, L"start") == 0)
+        result = ActionStart(cfg);
+    else if (_wcsicmp(cfg.action, L"stop") == 0)
+        result = ActionStop(cfg);
+    else if (_wcsicmp(cfg.action, L"delete") == 0)
+        result = ActionDelete(cfg);
+    else if (_wcsicmp(cfg.action, L"status") == 0 ||
+        _wcsicmp(cfg.action, L"query") == 0)
+        result = ActionStatus(cfg);
+    else {
+        wprintf(L"[-] Unknown action: %s\n", cfg.action);
+        Usage(argv[0]);
+        return 3;
+    }
+
+    return result ? 0 : 4;
 }
