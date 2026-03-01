@@ -1,0 +1,2 @@
+dump này nó hybrid giữa kỹ thuật của native dump core và wsass core
+sử dụng native api, unhook dll, werfaultsecure để lấy memory 

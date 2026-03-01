@@ -1,0 +1,112 @@
+* Code của WSASS
+- Nó tận dụng WerFaultSecure.exe
++ Đơn giản binary này là công cụ của Windows dùng để xử lý lỗi của ứng dụng và tạo file dump bộ nhớ khi có crash hoặc yêu cầu nào đó đặc biệt.
++ Chạy WerFaultSecure.exe với các  tham số (/h /pid <PID> /tid <TID> /file <handle> /encfile <handle> /cancel <handle> /type 268310) để yêu cầu dump full memory của tiến trình mục tiêu mà không cần gây crash thực sự. Tận dụng cơ chế báo lỗi của Windows để trích xuất dữ liệu bộ nhớ (bao gồm heap, stack, và các vùng nhạy cảm).
+- Protected Process Light (PPL)
++ Windows thường sử dụng PPL để bảo vệ các tiến trình quan trọng của hệ thống, điển hình là lsass.exe
++ Code tạo một tiến trình mới chạy WerFaultSecure.exe với mức bảo vệ PPL cao (ở đây là 0, tương ứng với WinTCB - mức cao nhất), sử dụng API như CreateProcessW với cờ CREATE_PROTECTED_PROCESS và UpdateProcThreadAttribute để đặt PROC_THREAD_ATTRIBUTE_PROTECTION_LEVEL.
++ Mục đích: Tiến trình PPL với mức bảo vệ cao có thể truy cập và dump các tiến trình PPL khác (như LSASS) mà không bị chặn bởi hệ thống bảo vệ
+
+* Các kỹ thuật hỗ trợ trong WSASS
+- Enable SeDebugPrivilege: Nâng quyền của process hiện tại để mở và thao tác với process mục tiêu.
+- Tìm main thread: Sử dụng NtQuerySystemInformation để liệt kê thông tin system processes và threads, xác định thread đầu tiên (thường là main thread) để chỉ định trong lệnh dump.
+- Resume loop: Một thread riêng chạy NtResumeProcess lặp lại để resume process mục tiêu nếu nó bị suspend trong quá trình dump, đảm bảo dump không bị gián đoạn.
+- Ngụy trang file dump: Sau khi tạo file dump (ban đầu là MDMP), project ghi đè magic header thành 0x89 0x50 0x4E 0x47 (PNG signature) để file trông như ảnh PNG, giúp tránh phát hiện bởi antivirus (vì AV thường quét file .dmp nhưng bỏ qua .png).
+
+
+* Native dump
+- Nó unhook ntdll để lấy ntdll sạch
+- Chỉ sử dụng native API sạch tự build hoặc lấy của ntdll.dll sạch
+- Nó lặp qua toàn bộ virtual address space để đọc từng memory region readable bằng NtReadVirtualMemory
+- Dựa vào SeDebugPrivilege + đọc trực tiếp memory của process khác (không cần PPL)
+- Các API chính dùng:
++ NtQueryVirtualMemory
++ NtReadVirtualMemory
++ NtQueryInformationProcess
++ Custom GetProcAddress
+- Tự xây dựng format MiniDump (MDMP) thủ công từ đầu (header + streams + memory regions)
+- Full readable committed memory regions (gần tương đương full dump, nhưng chỉ các vùng readable)
+- Tự xây dựng 3 streams chính:
++ SystemInfoStream
++ ModuleListStream
++ Memory64ListStream
+
+
+Trong trường hợp sử dụng werfaultsecure.exe của hệ thống
+
+
+Cần phải bypass được để dump lsass trên kis.
+
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RunAsPPL /t REG_DWORD /d 1 /f
+
+
+DCOM (Distributed COM) là phiên bản remote của COM, dùng RPC để chạy trên máy khác → lateral movement
+
+
+
+* Quá trình hook nếu build lab
+- Lấy địa chỉ vùng nhớ của hàm MessageBoxA
+- Đọc 6 bytes đầu tiên của MessageBoxA, cần 6 bytes này để unhooking hàm
++ Vì opcode JMP relative 32-bit là 5 bytes (E9 xx xx xx xx), nhưng nhiều compiler/malware đọc 6 bytes để an toàn hơn (tránh overwrite instruction không hoàn chỉnh).
+- Tạo một hàm HookedMessageBox mà sẽ thực thi khi hàm MessageBoxA được gọi
+- Lấy địa chỉ vùng nhớ của hàm HookedMessageBox
+- Patch / redirect MessageBoxA to HookedMessageBox
+- Khi gọi MessageBoxA thì code sẽ được chuyển hướng đến hàm HookedMessageBox
+- Hàm HookedMessageBox thực thi code của nó, sau đó thực hiện unhook hàm MessageBoxA (Khôi phục lại 6 bytes đầu cho MessageBoxA), rồi sau đó gọi lại hàm MessageBoxA origin
++ Mục đích unhook lại để tránh gọi đệ quy liên tục.
+
+
+
+* 
+** Unhook EDR hooks
+*** Lấy clean copy của ntdll từ \KnownDlls (kernel cache an toàn) hoặc disk (C:\Windows\System32\ntdll.dll).
+*** Parse PE header để lấy .text section (code segment) của ntdll.
+*** Overwrite .text của ntdll loaded (hooked) bằng clean copy (dùng NtProtectVirtualMemory để change protect → memcpy → restore protect).
+*** Tương tự cho kernel32/kernelbase.
+** Enable Privileges
+*** Sử dụng NtOpenProcessToken + NtAdjustPrivilegesToken để enable SeDebugPrivilege (luid 20), SeBackupPrivilege (19), SeRestorePrivilege (23).
+*** Mục đích: Mở handle LSASS (SeDebug), đọc file lock như hiberfil.sys (SeBackup).
+** Tìm PID LSASS
+*** NtQuerySystemInformation (SystemProcessInformation) để list process → so sánh image name lowercase với "lsass.exe".
+** Procwalk
+*** Đọc virtual memory của LSASS mà không dùng MiniDumpWriteDump
+**** Mở handle LSASS dùng NtOpenProcess với quyền PROCESS_QUERY_INFORMATION | PROCESS_VM_READ.
+**** Walk VA space bằng NtQueryVirtualMemory (MEMORY_BASIC_INFORMATION) từ 0x0 đến 0x7FFFFFFFFFFF (user-mode x64 limit).
+**** Chỉ đọc region readable: MEM_COMMIT, không PAGE_NOACCESS/GUARD, size > 0.
+**** Đọc bằng NtReadVirtualMemory (buffer 4MB, chia nhỏ nếu region lớn).
+**** Nếu đọc fail → log NTSTATUS (0xC0000022) + skip (DataSize=0).
+**** Ghi vào file NDMP: Header (magic "NDMP", PID, segment count) + từng Segment (base addr, size, protect, data raw).
+** Ramdump
+*** PhysicalMemory
+**** Mở \Device\PhysicalMemory bằng NtOpenSection → map từng chunk 64MB → ghi raw.
+Fail vì Windows block từ Vista+ (lỗi 0xC0000022).
+*** Hiberfil
+**** Direct: CreateFileW với FILE_FLAG_BACKUP_SEMANTICS + SeBackupPrivilege.
+**** VSS: Dùng IVssBackupComponents → tạo snapshot volume C: → copy hiberfil.sys từ shadow device.
+=> Fail vì không có hiberfil.sys (firmware không hỗ trợ S4).
+
+
+* Dump RAM
+- File khi dump ram có thể ở những dạng: .dmp, .mem, .raw, .img. Các file này chứa toàn bộ nội dung physical RAM tại thời điểm dump.
+
+* File dump RAM chứa các nội dung
+- Toàn bộ kernel memory (kernel code, drivers, pool, objects).
+- Toàn bộ user-mode memory của tất cả tiến trình đang chạy:
++ LSASS.exe → credential (NTLM hashes, Kerberos tickets, cached logons, DPAPI master keys).
++ Chrome/Firefox/Edge → session cookies, saved passwords (nếu chưa encrypt).
++ Explorer.exe, cmd.exe → command history, clipboard.
++ Các tiến trình khác → injected code, malware, plaintext password, encryption keys.
+- Paged và non-paged pool, registry hives in-memory, file cache.
+- Pagefile mapping (nếu có swap).
+- Driver objects, process list, handle table, token objects.
+
+* Có thể sử dụng các công cụ forensic điển hình như Volatility để phân tích và trích xuất vùng nhớ của tiến trình cụ thể.
+
+#define _CRT_SECURE_NO_WARNINGS
+
+
+* EDR hooking
+https://cyberwarfare.live/edr-series-how-edr-hooks-api-calls-part-1/
+https://s3cur3th1ssh1t.github.io/A-tale-of-EDR-bypass-methods/
+
+

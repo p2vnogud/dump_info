@@ -1,0 +1,1 @@
+code này sẽ chỉ sử dụng core của native dump nhưng có thêm một vài kỹ thuật để evasion hơn một chút.
