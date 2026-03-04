@@ -1,0 +1,38 @@
+Kiểu dữ liệu "HKEY"
+typedef HANDLE HKEY;
+typedef PVOID HANDLE;
+-> HKEY = void*
+Nó chỉ là một handle (con trỏ opaque) đại diện cho một registry key.
+
+* Registry trên Window tồn tại ở 2 view (2 dạng)
+HKLM\Software\MyApp              (64-bit)
+HKLM\Software\WOW6432Node\MyApp  (32-bit)
+
+* Sự khác biệt giữa "RegDeleteKey" và "RegDeleteKeyEx"
+** RegDeleteKey
+*** Không cho chọn view
+*** Xóa theo bitness của process. Ví dụ:
+**** Process 32-bit chạy trên hệ thống 64-bit: Nó xoá trong WOW6432Node
+**** Process 64-bit chạy trên hệ thống 64-bit: Nó xoá trong 64-bit view
+** RegDeleteKeyEx
+*** Có giá trị "samDesired" cho phép chọn view để xóa
+**** KEY_WOW64_64KEY
+**** KEY_WOW64_32KEY
+
+
+* Thực hiện liệt kê (enumerate) và query registry:
+- RegOpenKeyEx: mở key ở chế độ đọc hoặc đọc + write. Luôn dùng trước khi enumerate
+- RegQueryInfoKey: Lấy số lượng subkey + value + độ dài tên dài nhất. Bắt buộc dùng trước regenum*
+- RegEnumKeyEx: Liệt kê từng subkey (tên subkey). Duyệt cây registry
+- RegEnumValue: Liệt kê từng value (tên + type + data). Lấy tất cả giá trị trong key
+- RegQueryValueEx: Đọc dữ liệu của 1 value cụ thể. Khi đã biết tên value hoặc sau khi enumerate
+
+* Lưu ý cực quan trọng:
+** Phải gọi RegQueryInfoKey trước để biết:
+*** cSubKeys: số subkey
+*** cValues: số value
+*** cbMaxSubKeyLen: độ dài tên subkey dài nhất
+*** cbMaxValueNameLen: độ dài tên value dài nhất
+** Buffer phải lớn hơn ít nhất MAX_PATH (260) + 1, nhưng tốt nhất dùng giá trị từ RegQueryInfoKey.
+
+
