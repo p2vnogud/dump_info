@@ -1,0 +1,539 @@
+/*
+ * ============================================================
+ *  WinRM / WSMan Remote Command Executor
+ *  Compiler : MSVC (Visual Studio 2017+)
+ *  SDK      : Windows SDK 10.0.26100+
+ *
+ *  BIÊN DỊCH (Developer Command Prompt):
+ *    cl /EHsc /W3 /D_UNICODE /DUNICODE winrm_remote_exec.cpp ^
+ *       wsmsvc.lib ws2_32.lib /Fe:winrm_exec.exe
+ *
+ *  SỬ DỤNG:
+ *    winrm_exec.exe single 192.168.1.100 Administrator P@ss "ipconfig"
+ *    winrm_exec.exe batch  192.168.1 1 254 Administrator P@ss "hostname"
+ *
+ *  THIẾT LẬP TARGET (Admin trên máy target):
+ *    winrm quickconfig -y
+ *    winrm set winrm/config/client @{TrustedHosts="*"}
+ *    winrm set winrm/config/service @{AllowUnencrypted="true"}
+ *    winrm set winrm/config/service/auth @{Basic="true"}
+ * ============================================================
+ */
+
+ // ── PHẢI define version TRƯỚC khi include wsman.h ───────────
+#define WSMAN_API_VERSION_1_1
+
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <wsman.h>      // yêu cầu WSMAN_API_VERSION_1_1 đã define ở trên
+#include <stdio.h>
+#include <stdlib.h>
+#include <strsafe.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "Wsmsvc.lib")
+#pragma comment(lib, "Strsafe.lib")
+
+// ─── Hằng số ─────────────────────────────────────────────────
+#define WINRM_PORT_HTTP   5985
+#define WINRM_PORT_HTTPS  5986
+#define SHELL_URI         L"http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd"
+#define TIMEOUT_MS        30000
+
+// Numeric value của WSMAN_OPTION_TIMEOUTMS_SHELL_OPER (= 211)
+#define OPT_TIMEOUT_SHELL ((WSManSessionOption)211)
+
+// ═══════════════════════════════════════════════════════════════
+//  Async callback context
+//  SDK 10.0.26100: callback nhận WSMAN_RESPONSE_DATA* (union)
+//  thay vì WSMAN_RECEIVE_DATA_RESULT*.
+//  Ta chỉ decode khi biết loại operation (receive).
+// ═══════════════════════════════════════════════════════════════
+typedef struct _ASYNC_CTX {
+    HANDLE               hEvent;
+    HRESULT              hr;
+    WSMAN_SHELL_HANDLE   hShell;
+    WSMAN_COMMAND_HANDLE hCommand;
+    // output accumulation
+    char* pStdOut;
+    DWORD   cbStdOut;
+    char* pStdErr;
+    DWORD   cbStdErr;
+    DWORD   dwExitCode;
+    BOOL    bDone;
+    // TRUE nếu đây là receive-output context (để decode WSMAN_RESPONSE_DATA)
+    BOOL    bReceiveCtx;
+} ASYNC_CTX;
+
+// ─── Print helpers ────────────────────────────────────────────
+static void Info(LPCWSTR fmt, ...)
+{
+    va_list v; va_start(v, fmt);
+    wprintf(L"[*] "); vwprintf(fmt, v); wprintf(L"\n"); va_end(v);
+}
+static void OK(LPCWSTR fmt, ...)
+{
+    va_list v; va_start(v, fmt);
+    wprintf(L"[+] "); vwprintf(fmt, v); wprintf(L"\n"); va_end(v);
+}
+static void ErrHr(LPCWSTR ctx, HRESULT hr)
+{
+    WCHAR buf[512] = {};
+    FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, (DWORD)hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        buf, (DWORD)ARRAYSIZE(buf), NULL);
+    fwprintf(stderr, L"[!] %s  hr=0x%08X  %s\n", ctx, (UINT)hr, buf);
+}
+
+// ─── Append raw bytes vào buffer ─────────────────────────────
+static void AppendBuf(char** pp, DWORD* pcb, const BYTE* src, DWORD len)
+{
+    char* tmp = (char*)realloc(*pp, *pcb + len + 1);
+    if (!tmp) return;
+    *pp = tmp;
+    memcpy(*pp + *pcb, src, len);
+    *pcb += len;
+    (*pp)[*pcb] = '\0';
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Callback – signature phù hợp SDK 10.0.26100
+//
+//  WSMAN_SHELL_COMPLETION_FUNCTION:
+//    void CALLBACK fn(
+//        PVOID                  operationContext,
+//        DWORD                  flags,
+//        WSMAN_ERROR*           error,
+//        WSMAN_SHELL_HANDLE     shell,
+//        WSMAN_COMMAND_HANDLE   command,
+//        WSMAN_OPERATION_HANDLE operationHandle,   // ← tên param đầy đủ
+//        WSMAN_RESPONSE_DATA*   data               // ← WSMAN_RESPONSE_DATA, không phải RECEIVE_DATA_RESULT
+//    );
+// ═══════════════════════════════════════════════════════════════
+static void CALLBACK WsmanCB(
+    PVOID                  operationContext,
+    DWORD                  flags,
+    WSMAN_ERROR* error,
+    WSMAN_SHELL_HANDLE     shell,
+    WSMAN_COMMAND_HANDLE   command,
+    WSMAN_OPERATION_HANDLE operationHandle,
+    WSMAN_RESPONSE_DATA* data              // SDK 10.0.26100 dùng WSMAN_RESPONSE_DATA
+)
+{
+    (void)operationHandle;
+    ASYNC_CTX* ctx = (ASYNC_CTX*)operationContext;
+    if (!ctx) return;
+
+    // ── Lỗi WSMan ────────────────────────────────────────────
+    if (error && error->code != 0) {
+        ctx->hr = HRESULT_FROM_WIN32(error->code);
+        fwprintf(stderr, L"[CB] err=%u  %s\n", error->code,
+            error->errorDetail ? error->errorDetail : L"(no detail)");
+        SetEvent(ctx->hEvent);
+        return;
+    }
+    ctx->hr = S_OK;
+
+    // ── Lưu handle ───────────────────────────────────────────
+    if (shell)   ctx->hShell = shell;
+    if (command) ctx->hCommand = command;
+
+    // ── Xử lý receive data (chỉ khi là receive context) ─────
+    // WSMAN_RESPONSE_DATA là union:
+    //   receiveData  → WSMAN_RECEIVE_DATA_RESULT  (khi gọi WSManReceiveShellOutput)
+    //   connectData  → WSMAN_CONNECT_DATA
+    //   createData   → WSMAN_CREATE_SHELL_DATA
+    //
+    // Vì union không có tag, ta dùng flag bReceiveCtx để biết khi nào
+    // data->receiveData hợp lệ.
+    if (ctx->bReceiveCtx && data) {
+        WSMAN_RECEIVE_DATA_RESULT* recv = &data->receiveData;
+
+        // commandState: kiểm tra lệnh đã xong chưa
+        if (recv->commandState) {
+            if (wcscmp(recv->commandState, WSMAN_COMMAND_STATE_DONE) == 0) {
+                ctx->dwExitCode = recv->exitCode;
+                ctx->bDone = TRUE;
+            }
+        }
+
+        // stream data – SDK 10.0.26100: WSMAN_DATA chỉ có binaryData
+        // (không có textData). Output từ CMD luôn là binary (OEM bytes).
+        // Mỗi lần callback trả về 1 chunk duy nhất.
+        if (recv->streamData.binaryData.dataLength > 0)
+        {
+            AppendBuf(&ctx->pStdOut, &ctx->cbStdOut,
+                recv->streamData.binaryData.data,
+                recv->streamData.binaryData.dataLength);
+        }
+    }
+
+    // ── Signal event khi operation kết thúc ──────────────────
+    if (flags & WSMAN_FLAG_CALLBACK_END_OF_OPERATION)
+        SetEvent(ctx->hEvent);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility: Init / Free context
+// ═══════════════════════════════════════════════════════════════
+static BOOL InitCtx(ASYNC_CTX* ctx, BOOL bRecv = FALSE)
+{
+    ZeroMemory(ctx, sizeof(*ctx));
+    ctx->bReceiveCtx = bRecv;
+    ctx->hEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    return ctx->hEvent != NULL;
+}
+static void FreeCtx(ASYNC_CTX* ctx)
+{
+    if (ctx->hEvent) { CloseHandle(ctx->hEvent); ctx->hEvent = NULL; }
+    if (ctx->pStdOut) { free(ctx->pStdOut);        ctx->pStdOut = NULL; }
+    if (ctx->pStdErr) { free(ctx->pStdErr);        ctx->pStdErr = NULL; }
+}
+static HRESULT WaitCtx(ASYNC_CTX* ctx, DWORD ms = TIMEOUT_MS)
+{
+    if (WaitForSingleObject(ctx->hEvent, ms) == WAIT_TIMEOUT) {
+        fwprintf(stderr, L"[!] Timeout %lu ms\n", ms);
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    }
+    return ctx->hr;
+}
+
+// ─── In buffer OEM/UTF-8 ra console ─────────────────────────
+static void PrintBuf(const char* buf, DWORD cb)
+{
+    if (!buf || cb == 0) return;
+    // Thử in qua WriteConsoleA để tránh vấn đề codepage
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD  written = 0;
+    WriteConsoleA(hOut, buf, cb, &written, NULL);
+    if (written == 0) {
+        // Fallback: printf
+        fwrite(buf, 1, cb, stdout);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  WSMan Native – thực thi lệnh trên một host
+// ═══════════════════════════════════════════════════════════════
+static HRESULT WsmanExecSingle(
+    LPCWSTR ip, LPCWSTR usr, LPCWSTR pw,
+    LPCWSTR cmd, BOOL bHTTPS)
+{
+    HRESULT hr = S_OK;
+    WSMAN_API_HANDLE       hAPI = NULL;
+    WSMAN_SESSION_HANDLE   hSess = NULL;
+    WSMAN_SHELL_HANDLE     hShl = NULL;
+    WSMAN_COMMAND_HANDLE   hCmd = NULL;
+    WSMAN_OPERATION_HANDLE hOp = NULL;
+
+    // 1. Init WSMan API
+    hr = WSManInitialize(WSMAN_FLAG_REQUESTED_API_VERSION_1_1, &hAPI);
+    if (FAILED(hr)) { ErrHr(L"WSManInitialize", hr); return hr; }
+    OK(L"WSMan API OK");
+
+    // 2. Endpoint URL
+    WCHAR szEP[512];
+    StringCchPrintfW(szEP, ARRAYSIZE(szEP), L"%s://%s:%d/wsman",
+        bHTTPS ? L"https" : L"http", ip,
+        bHTTPS ? WINRM_PORT_HTTPS : WINRM_PORT_HTTP);
+    Info(L"Endpoint: %s", szEP);
+
+    // 3. Credentials (Negotiate = NTLM hoặc Kerberos tự chọn)
+    WSMAN_USERNAME_PASSWORD_CREDS upc = {};
+    upc.username = usr;
+    upc.password = pw;
+    WSMAN_AUTHENTICATION_CREDENTIALS auth = {};
+    auth.authenticationMechanism = WSMAN_FLAG_AUTH_NEGOTIATE;
+    auth.userAccount = upc;
+
+    // 4. Tạo session
+    //    Tham số 4 = WSMAN_PROXY_INFO* → truyền NULL
+    //    Tham số 5 = WSMAN_OPTION_SET* → truyền NULL
+    hr = WSManCreateSession(hAPI, szEP, 0, &auth, NULL, &hSess);
+    if (FAILED(hr)) { ErrHr(L"WSManCreateSession", hr); goto done; }
+    OK(L"Session OK → %s", ip);
+
+    // 5. Set timeout
+    {
+        WSMAN_DATA d = {};
+        d.type = WSMAN_DATA_TYPE_DWORD;
+        d.number = TIMEOUT_MS;
+        WSManSetSessionOption(hSess, OPT_TIMEOUT_SHELL, &d);
+
+        if (bHTTPS) {
+            WSMAN_DATA t = {}; t.type = WSMAN_DATA_TYPE_DWORD; t.number = 1;
+            WSManSetSessionOption(hSess, WSMAN_OPTION_SKIP_CA_CHECK, &t);
+            WSManSetSessionOption(hSess, WSMAN_OPTION_SKIP_CN_CHECK, &t);
+        }
+    }
+
+    // 6. Tạo remote CMD shell
+    {
+        ASYNC_CTX ctx;
+        if (!InitCtx(&ctx)) { hr = E_OUTOFMEMORY; goto done; }
+        WSMAN_SHELL_ASYNC a = { &ctx, WsmanCB };
+        WSManCreateShell(hSess, 0, SHELL_URI, NULL, NULL, NULL, &a, &hShl);
+        hr = WaitCtx(&ctx);
+        if (SUCCEEDED(hr)) hShl = ctx.hShell;
+        FreeCtx(&ctx);
+        if (FAILED(hr)) { ErrHr(L"WSManCreateShell", hr); goto done; }
+        OK(L"Shell tạo OK");
+    }
+
+    // 7. Gửi lệnh
+    {
+        ASYNC_CTX ctx;
+        if (!InitCtx(&ctx)) { hr = E_OUTOFMEMORY; goto done; }
+        WSMAN_SHELL_ASYNC a = { &ctx, WsmanCB };
+        Info(L"Exec: %s", cmd);
+        WSManRunShellCommand(hShl, 0, cmd, NULL, NULL, &a, &hCmd);
+        hr = WaitCtx(&ctx);
+        if (SUCCEEDED(hr)) hCmd = ctx.hCommand;
+        FreeCtx(&ctx);
+        if (FAILED(hr)) { ErrHr(L"WSManRunShellCommand", hr); goto done; }
+        OK(L"Lệnh đã gửi, đang nhận output...");
+    }
+
+    // 8. Receive output loop
+    //    Mỗi lần gọi WSManReceiveShellOutput sẽ callback 1 chunk.
+    //    Lặp đến khi commandState == Done.
+    {
+        // WSMAN_STREAM_ID_SET: streamIDs là PCWSTR* trỏ tới mảng PCWSTR
+        PCWSTR       streamArr[2] = { L"stdout", L"stderr" };
+        WSMAN_STREAM_ID_SET ss = {};
+        ss.streamIDsCount = 2;
+        ss.streamIDs = streamArr;   // PCWSTR* đúng kiểu
+
+        ASYNC_CTX ctx;
+        if (!InitCtx(&ctx, TRUE /*bRecv*/)) { hr = E_OUTOFMEMORY; goto done; }
+
+        while (!ctx.bDone)
+        {
+            ResetEvent(ctx.hEvent);
+            WSMAN_SHELL_ASYNC a = { &ctx, WsmanCB };
+            WSManReceiveShellOutput(hShl, hCmd, 0, &ss, &a, &hOp);
+
+            hr = WaitCtx(&ctx, TIMEOUT_MS);
+            if (hOp) { WSManCloseOperation(hOp, 0); hOp = NULL; }
+            if (FAILED(hr)) break;
+        }
+
+        // In kết quả
+        wprintf(L"\n══════════════════ OUTPUT ══════════════════\n");
+        PrintBuf(ctx.pStdOut, ctx.cbStdOut);
+        if (ctx.pStdErr && ctx.cbStdErr) {
+            wprintf(L"\n── STDERR ──────────────────────────────────\n");
+            PrintBuf(ctx.pStdErr, ctx.cbStdErr);
+        }
+        wprintf(L"\n════════════════════════════════════════════\n");
+        OK(L"ExitCode: %lu", ctx.dwExitCode);
+        FreeCtx(&ctx);
+    }
+
+done:
+    if (hOp)   WSManCloseOperation(hOp, 0);
+    if (hCmd)  WSManCloseCommand(hCmd, 0, NULL);
+    if (hShl)  WSManCloseShell(hShl, 0, NULL);
+    if (hSess) WSManCloseSession(hSess, 0);
+    if (hAPI)  WSManDeinitialize(hAPI, 0);
+    Info(L"Cleanup xong");
+    return hr;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fallback: winrs.exe qua CreateProcess + Pipe
+//  Không cần wsmsvc.lib, hoạt động trên mọi máy có winrs.exe
+// ═══════════════════════════════════════════════════════════════
+static DWORD WinrsProcess(
+    LPCWSTR ip, LPCWSTR usr, LPCWSTR pw, LPCWSTR cmd)
+{
+    WCHAR szLine[2048];
+    StringCchPrintfW(szLine, ARRAYSIZE(szLine),
+        L"winrs.exe -r:http://%s:%d -u:%s -p:%s \"%s\"",
+        ip, WINRM_PORT_HTTP, usr, pw, cmd);
+    Info(L"[winrs] %s", szLine);
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hR = NULL, hW = NULL;
+    if (!CreatePipe(&hR, &hW, &sa, 0)) return (DWORD)-1;
+    SetHandleInformation(hR, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW    si = {}; PROCESS_INFORMATION pi = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hW;
+    si.hStdError = hW;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    if (!CreateProcessW(NULL, szLine, NULL, NULL,
+        TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        ErrHr(L"CreateProcess(winrs)", HRESULT_FROM_WIN32(GetLastError()));
+        CloseHandle(hR); CloseHandle(hW);
+        return (DWORD)-1;
+    }
+    CloseHandle(hW);
+
+    wprintf(L"\n══════════════════ OUTPUT ══════════════════\n");
+    char  buf[4096]; DWORD dwR = 0;
+    HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+    while (ReadFile(hR, buf, sizeof(buf) - 1, &dwR, NULL) && dwR > 0) {
+        DWORD w = 0;
+        WriteConsoleA(hCon, buf, dwR, &w, NULL);
+        if (!w) fwrite(buf, 1, dwR, stdout);
+    }
+    wprintf(L"\n════════════════════════════════════════════\n");
+
+    WaitForSingleObject(pi.hProcess, TIMEOUT_MS);
+    DWORD ex = 0;
+    GetExitCodeProcess(pi.hProcess, &ex);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hR);
+    OK(L"ExitCode: %lu", ex);
+    return ex;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ping check (dùng ping.exe, không cần raw socket)
+// ═══════════════════════════════════════════════════════════════
+static BOOL PingHost(LPCWSTR ip)
+{
+    WCHAR cmd[256];
+    StringCchPrintfW(cmd, ARRAYSIZE(cmd), L"ping -n 1 -w 800 %s", ip);
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hR = NULL, hW = NULL;
+    if (!CreatePipe(&hR, &hW, &sa, 0)) return FALSE;
+    SetHandleInformation(hR, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = {}; PROCESS_INFORMATION pi = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hW; si.hStdError = hW;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL,
+        TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(hW);
+    if (!ok) { CloseHandle(hR); return FALSE; }
+    // Drain pipe để tránh deadlock
+    char tmp[256]; DWORD r;
+    while (ReadFile(hR, tmp, sizeof(tmp), &r, NULL) && r > 0) {}
+    WaitForSingleObject(pi.hProcess, 4000);
+    DWORD ex = 1; GetExitCodeProcess(pi.hProcess, &ex);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hR);
+    return ex == 0;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Batch exec toàn subnet
+// ═══════════════════════════════════════════════════════════════
+static void BatchExec(
+    LPCWSTR subnet, int nStart, int nEnd,
+    LPCWSTR usr, LPCWSTR pw, LPCWSTR cmd)
+{
+    wprintf(L"\n╔══════════════════════════════════════════════════╗\n");
+    wprintf(L"║  BATCH EXEC  %s.%d - %d\n", subnet, nStart, nEnd);
+    wprintf(L"║  Command: %s\n", cmd);
+    wprintf(L"╚══════════════════════════════════════════════════╝\n\n");
+
+    for (int i = nStart; i <= nEnd; i++) {
+        WCHAR ip[64];
+        StringCchPrintfW(ip, ARRAYSIZE(ip), L"%s.%d", subnet, i);
+        wprintf(L"─── %-16s ", ip);
+        if (!PingHost(ip)) { wprintf(L"[OFFLINE]\n"); continue; }
+        wprintf(L"[ONLINE] → ");
+        fflush(stdout);
+        DWORD ex = WinrsProcess(ip, usr, pw, cmd);
+        wprintf(L"exit=%lu\n", ex);
+    }
+    wprintf(L"\n[*] Batch done.\n");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Usage
+// ═══════════════════════════════════════════════════════════════
+static void Usage(LPCWSTR exe)
+{
+    wprintf(
+        L"\nWinRM Remote Exec  (SDK 10.0.26100)\n\n"
+        L"  %s single <IP> <user> <pass> <command>\n"
+        L"  %s batch  <subnet> <start> <end> <user> <pass> <command>\n\n"
+        L"Vi du:\n"
+        L"  %s single 192.168.1.100 Administrator P@ss \"ipconfig /all\"\n"
+        L"  %s batch  192.168.1 1 254 Administrator P@ss \"hostname\"\n\n"
+        L"Thiet lap target (Admin):\n"
+        L"  winrm quickconfig -y\n"
+        L"  winrm set winrm/config/client @{TrustedHosts=\"*\"}\n"
+        L"  winrm set winrm/config/service @{AllowUnencrypted=\"true\"}\n"
+        L"  winrm set winrm/config/service/auth @{Basic=\"true\"}\n\n",
+        exe, exe, exe, exe);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  wmain
+// ═══════════════════════════════════════════════════════════════
+int wmain(int argc, WCHAR* argv[])
+{
+    SetConsoleOutputCP(CP_UTF8);
+
+    if (argc < 2) { Usage(argv[0]); return 1; }
+
+    if (_wcsicmp(argv[1], L"single") == 0)
+    {
+        // argv: [0]=exe [1]=single [2]=IP [3]=user [4]=pass [5]=cmd
+        // argc toi thieu = 6
+        if (argc < 6) {
+            wprintf(L"Thieu tham so: single <IP> <user> <pass> <command>\n");
+            return 1;
+        }
+        LPCWSTR ip = argv[2];
+        LPCWSTR usr = argv[3];
+        LPCWSTR pw = argv[4];
+
+        // Gop tat ca argv[5..] thanh 1 chuoi lenh
+        // (xu ly truong hop shell tach arg du da co dau ngoac kep)
+        WCHAR szCmd[2048] = {};
+        for (int i = 5; i < argc; i++) {
+            if (i > 5) StringCchCatW(szCmd, ARRAYSIZE(szCmd), L" ");
+            StringCchCatW(szCmd, ARRAYSIZE(szCmd), argv[i]);
+        }
+        wprintf(L"\n[SINGLE] Target=%s  Cmd=%s\n\n", ip, szCmd);
+
+        HRESULT hr = WsmanExecSingle(ip, usr, pw, szCmd, FALSE);
+        if (FAILED(hr)) {
+            wprintf(L"\n[*] WSMan that bai (hr=0x%08X), thu fallback winrs.exe...\n\n",
+                (UINT)hr);
+            WinrsProcess(ip, usr, pw, szCmd);
+        }
+    }
+    else if (_wcsicmp(argv[1], L"batch") == 0)
+    {
+        // argv: [0]=exe [1]=batch [2]=subnet [3]=start [4]=end [5]=user [6]=pass [7]=cmd
+        // argc toi thieu = 8
+        if (argc < 8) {
+            wprintf(L"Thieu tham so: batch <subnet> <start> <end> <user> <pass> <cmd>\n");
+            return 1;
+        }
+        // Gop argv[7..] thanh lenh
+        WCHAR szBCmd[2048] = {};
+        for (int i = 7; i < argc; i++) {
+            if (i > 7) StringCchCatW(szBCmd, ARRAYSIZE(szBCmd), L" ");
+            StringCchCatW(szBCmd, ARRAYSIZE(szBCmd), argv[i]);
+        }
+        BatchExec(argv[2], _wtoi(argv[3]), _wtoi(argv[4]),
+            argv[5], argv[6], szBCmd);
+    }
+    else {
+        Usage(argv[0]);
+        return 1;
+    }
+
+    return 0;
+}

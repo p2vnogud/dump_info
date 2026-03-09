@@ -1,0 +1,387 @@
+Cốt lõi 1: DCOM cho phép remote activation + remote method invocation mà không cần drop file hay dùng service riêng (như PsExec). Chỉ cần CLSID hợp lệ và credential admin là có thể "kích hoạt" object từ xa.
+Cốt lõi 2: Các object này có execution primitive built-in (ShellExecute, ExecuteShellCommand, load DLL, install driver, v.v.) – là tính năng hợp lệ cho automation/quản trị, nhưng attacker abuse để chạy arbitrary code. Microsoft không block remote call vì legacy support.
+
+Cốt lõi là DCOM cho phép remote activation + invocation của COM object hợp lệ, và một số object expose method "execution primitive" (ShellExecute, ExecuteShellCommand, load DLL) – kết hợp với quyền admin + impersonation → attacker có thể chạy arbitrary command/DLL trên remote machine mà không cần tool bên ngoài.
+
+
+* Không phải DCOM object nào cũng cho remote command execution. Chỉ những object expose method/property "execution primitive" (có khả năng chạy code/shell/DLL) mới bị abuse:
+** MMC20.Application:
+Expose Document.ActiveView.ExecuteShellCommand(command, dir, params, windowState).
+Đây là method hợp lệ của MMC để chạy shell command trong snap-in (ví dụ: tự động hóa admin task).
+** ShellWindows / ShellBrowserWindow:
+Expose Document.Application.ShellExecute(exe, params, dir, verb, showCmd).
+Đây là interface của Windows Explorer (shell) để mở file/chạy chương trình.
+Remote activation → chạy trong explorer.exe hiện có (không spawn process mới) → ShellExecute gọi WinAPI ShellExecuteW → spawn child process (cmd.exe, powershell.exe, v.v.).
+** MSI Custom Action Server (2025 abuse):
+Expose method như SQLInstallDriverEx, SQLConfigDriver.
+Khi gọi → trigger ODBC driver install → load DLL custom (nếu attacker đã upload DLL qua SMB trước).
+Chạy dưới msiexec.exe (Windows Installer) → có thể SYSTEM nếu custom action config no-impersonate.
+** COpenControlPanel (2025 Kaspersky research):
+Expose IOpenControlPanel::Open → load CPL (Control Panel applet) → load DLL qua registry.
+Có thể persistence (load khi mở Control Panel).
+
+
+
+* Những phương thức trong COM có khả năng remote command
+1. Shell-Related COM Objects (Biến thể phổ biến nhất)
+- ShellWindows (CLSID: {9BA05972-F6A8-11CF-A442-00A0C90A8F39}): Khởi tạo instance từ xa, truy cập property Document.Application.Parent để gọi ShellExecute, chạy lệnh như cmd.exe. Thường dùng trong Impacket dcomexec.py.
+- ShellBrowserWindow (CLSID: {C08AFD90-F2A1-11D1-8455-00A0C91F3880}): Tương tự ShellWindows, gọi ShellExecute qua Document.Application. Ít gây nhiễu hơn trên Windows mới.
+- Shell.Application (CLSID: {13709620-C279-11CE-A49E-444553540000}): Sử dụng IShellDispatch interface để gọi ShellExecute trực tiếp. Thường fail trên Windows 10+ do hạn chế remote activation.
+2. MMC (Microsoft Management Console) COM Objects
+- MMC20.Application (CLSID: {49B2791A-B1AE-4C90-9B8E-E860BA07F889}): Khởi tạo MMC instance từ xa, sử dụng Document.ActiveView.ExecuteShellCommand để chạy lệnh. Rất phổ biến cho lateral movement, hỗ trợ trong Impacket.
+- Control Panel Items via DCOM: Sử dụng DCOM để truy cập Control Panel objects (như CPL files), gọi methods để chạy lệnh hoặc persistence. Đây là biến thể mới hơn, kết hợp với initial access.
+3. Office Application COM Objects
+Những object này yêu cầu Office cài đặt trên máy mục tiêu.
+- Excel.Application (CLSID: {00020812-0000-0000-C000-000000000046}): Khởi tạo Excel từ xa, gọi methods như Run để chạy macro hoặc shell commands.
+- Word.Application (CLSID: {00020906-0000-0000-C000-000000000046}): Tương tự Excel, sử dụng để chạy commands qua macros.
+4. Scripting and Automation COM Objects
+- WScript.Shell (CLSID: {72C24DD5-D70A-438B-8A42-98424B88AFB8}): Gọi Run method để chạy lệnh. Thường kết hợp với VBScript hoặc JScript từ xa.
+- Schedule.Service (Task Scheduler) (CLSID: {0F87369F-A4E5-4CFC-B942-A884185C9DA1}): Tạo task từ xa để chạy lệnh theo lịch, sử dụng ITaskService interface.
+5. Các Phương Pháp Khác (Ít Phổ Biến hoặc Biến Thể)
+- Custom Registry-Based DCOM: Sửa registry trên máy mục tiêu để trỏ CLSID đến binary không tồn tại, sau đó khởi tạo để chạy payload tùy chỉnh (như exe giả mạo).
+- DCOM Upload & Execute: Viết DLL tùy chỉnh vào Global Assembly Cache (GAC) từ xa, sau đó load và chạy qua service context.
+- WMI via DCOM (Win32_Process): Mặc dù WMI là lớp trên COM, có thể dùng IWbemServices để tạo process từ xa (tương tự Win32_Process.Create).
+- Performance Logs (ServerDataCollectorSet): Sử dụng methods như Extract để chạy lệnh gián tiếp, nhưng chủ yếu cho NTLM relay/coercion.
+- FileSystemImage hoặc UpdateSession: Tương tự, dùng cho coercion nhưng có thể dẫn đến exec trong một số trường hợp.
+
+
+
+
+
+
+
+
+Có thể remote command thông qua PowerShell Remoting (PSRemoting)
+Test-WSMan -ComputerName 192.168.17.36 -Authentication Basic -Credential (New-Object PSCredential("Administrator", (ConvertTo-SecureString "P@ssw0rd123" -AsPlainText -Force)))
+
+
+* WINRM WSMAN
+** Trên máy client
+# Bật service
+Start-Service WinRM
+Set-Service WinRM -StartupType Automatic
+
+# Kiểm tra
+Get-Service WinRM
+
+# Dùng PowerShell thay vì winrm.cmd
+Enable-PSRemoting -Force -SkipNetworkProfileCheck
+
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force
+Set-Item WSMan:\localhost\Client\AllowUnencrypted -Value $true -Force
+
+# Verify
+Get-Item WSMan:\localhost\Client\TrustedHosts
+
+** Trên máy remote
+Start-Service WinRM
+Set-Service WinRM -StartupType Automatic
+Enable-PSRemoting -Force -SkipNetworkProfileCheck
+winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+winrm set winrm/config/service/auth '@{Basic="true"}'
+Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true
+Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -Enabled True -ErrorAction SilentlyContinue
+netsh advfirewall firewall add rule name="WinRM 5985" protocol=TCP dir=in localport=5985 action=allow
+
+** Test lại trên client
+# Test trước khi chạy tool
+Test-WSMan -ComputerName 192.168.17.36 -Authentication Basic `
+    -Credential (New-Object PSCredential("Administrator", `
+    (ConvertTo-SecureString "P@ssw0rd123" -AsPlainText -Force)))
+
+
+
+** Fix nếu gặp lỗi
+*** Trên máy target
+# Bước 1: Đổi network profile từ Public → Private (bắt buộc)
+Set-NetConnectionProfile -NetworkCategory Private
+
+# Bước 2: Bây giờ mới set được
+winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+winrm set winrm/config/service/auth '@{Basic="true"}'
+
+# Kiểm tra
+winrm get winrm/config/service/auth
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++
+192.168.17.36 Administrator P@ssw0rd123 "cmd.exe /c whoami > C:\out.txt"
+
+
+Namespace ROOT\CIMV2 chứa đa số class quản lý hệ thống Windows dựa trên chuẩn Common Information Model.
+Trong đó có các class cực kỳ quan trọng như:
+| Class                   | Chức năng       |
+| ----------------------- | --------------- |
+| `Win32_Process`         | quản lý process |
+| `Win32_Service`         | quản lý service |
+| `Win32_OperatingSystem` | thông tin OS    |
+| `Win32_LogicalDisk`     | thông tin ổ đĩa |
+| `Win32_NetworkAdapter`  | network         |
+| `Win32_UserAccount`     | user account    |
+
+Vì vậy hầu hết các thao tác quản trị hệ thống đều nằm trong namespace này.
+
+Người ta dùng ROOT\CIMV2 khi remote vì:
+
+1️⃣ Là namespace chuẩn của CIM
+2️⃣ Chứa đa số class Win32 quản lý hệ thống
+3️⃣ Có trên mọi Windows
+4️⃣ Cho phép process execution từ xa
+
+
+ROOT\CIMV2
+   ↓
+Win32_Process
+   ↓
+Create()
+   ↓
+Remote command execution
+
+ROOT\CIMV2 là nơi chứa hầu hết class quản trị Windows, nên gần như mọi thao tác remote qua WMI đều bắt đầu từ đây.
+
+
+
+
+Namespace trong WMI là không gian chứa các class quản lý hệ thống theo chuẩn Common Information Model.
+Cấu trúc dạng cây:
+ROOT
+ ├─ CIMV2
+ ├─ Microsoft
+ │   └─ Windows
+ │       └─ Defender
+ ├─ SecurityCenter2
+ ├─ subscription
+ └─ default
+
+Mỗi namespace:
+- chứa class khác nhau
+- phục vụ mục đích quản lý khác nhau
+- có quyền truy cập khác nhau
+
+===============================================================
+| Format | Ý nghĩa             |
+| ------ | ------------------- |
+| `%d`   | số nguyên           |
+| `%f`   | số thực             |
+| `%s`   | chuỗi               |
+| `%c`   | ký tự               |
+| `%p`   | **địa chỉ pointer** |
+
+
+
+Vì sao void* tồn tại?
+
+Để viết function dùng được với mọi kiểu pointer.
+
+Ví dụ:
+void printAddress(void* ptr)
+{
+    printf("%p\n", ptr);
+}
+
+Có thể truyền vào
+int*
+char*
+struct*
+
+**********************************
+Pointer-to-pointer là gì?
+
+* là một cấp pointer.
+| Kiểu    | Ý nghĩa             |
+| ------- | ------------------- |
+| `int*`  | pointer tới int     |
+| `int**` | pointer tới pointer |
+
+
+Ví dụ:
+int x = 5;
+
+int* p = &x;
+
+int** pp = &p;
+
+Thì:
+x = 5
+address = 0x1000
+
+p = 0x1000
+address = 0x2000
+
+pp = 0x2000
+
+
+***********************
+Thực tế nếu gặp "LPVOID *ppv" thì có nghĩa là "void**
+-> Function cần ghi pointer kết quả vào biến.
+
+**********************
+Áp dụng vào code
+IShellLinkW* pShellLink = NULL;
+
+CoCreateInstance(..., (void**)&pShellLink);
+-> truyền địa chỉ của biến pShellLink để function có thể ghi pointer interface vào đó
+
+
+*****************************************
+nguyên tắc
+- Biến: chứa giá trị
+- Con trỏ: chứa địa chỉ của biến
+- Pointer to pointer: chứa địa chỉ của con trỏ
+- Đọc pointer thì dùng void*
+- Sửa pointer thì dùng void**
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+* CoInitialize
+
+
+
+* CoCreateInstance
+** Tạo một COM object và trả về interface pointer để bạn gọi method của object đó.
+CLSID  →  tạo object  →  lấy interface  →  dùng interface gọi function
+** HRESULT CoCreateInstance(
+  REFCLSID  rclsid,
+  LPUNKNOWN pUnkOuter,
+  DWORD     dwClsContext,
+  REFIID    riid,
+  LPVOID    *ppv
+);
+*** rclsid: Là CLSID của COM class bạn muốn tạo. CLSID = GUID định danh class COM
+**** CLSID
+   ↓
+lookup registry
+   ↓
+tìm DLL / EXE server
+   ↓
+load server
+   ↓
+tạo object
+*** pUnkOuter: Parameter này dùng cho COM aggregation. COM Aggregation là một kỹ thuật trong COM cho phép một object “chứa” object khác nhưng bên ngoài chỉ nhìn thấy một object duy nhất.
+*** dwClsContext: Chỉ định object được tạo ở đâu
+**** | Constant              | Meaning            |
+| --------------------- | ------------------ |
+| CLSCTX_INPROC_SERVER  | object trong DLL   |
+| CLSCTX_INPROC_HANDLER | handler DLL        |
+| CLSCTX_LOCAL_SERVER   | EXE local process  |
+| CLSCTX_REMOTE_SERVER  | EXE remote machine |
+****  CLSCTX_ALL: CLSCTX_ALL = INPROC_SERVER | INPROC_HANDLER | LOCAL_SERVER | REMOTE_SERVER
+*** riid: Là interface ID bạn muốn lấy. Một COM object có thể implement nhiều interface.
+**** COM object
+   ├── IUnknown
+   ├── IDispatch
+   └── IFileDialog
+*** ppv: Pointer nhận interface pointer
+** Giá trị trả về (HRESULT)
+*** S_OK: Object tạo thành công.
+*** REGDB_E_CLASSNOTREG: CLSID không có trong registry.
+*** CLASS_E_NOAGGREGATION: Class không hỗ trợ aggregation nhưng bạn truyền pUnkOuter
+*** E_NOINTERFACE: Object không implement interface bạn yêu cầu.
+*** E_POINTER: ppv = NULL.
+
+
+
+
+
+* Lưu ý:
+** CoCreateInstance: chỉ tạo một object, trên máy local
+** CoCreateInstanceEx: tạo object trên máy remote (vd: DCOM, ...)
+** CoGetClassObject: tạo nhiều instance
+*** Như vậy không cần lookup registry nhiều lần.
+** 
+*** InnerObject
+   QueryInterface
+      ↓
+delegate sang
+      ↓
+OuterObject
+*** Không aggregation: Client
+   ↓
+InnerObject
+   ↓
+IUnknown
+*** Có aggregation: Client
+   ↓
+OuterObject
+   ↓
+IUnknown
+   ↓
+InnerObject
+** Cách tìm được CLSID
+*** Cách 1: registry
+**** HKCR\CLSID
+*** Cách 2: Header file của Windows SDK (vd: shobjidl.h, objbase.h)
+*** Cách 3: Dùng tool xem COM objects (d: oleview.exe)
+*** Cách 4: Tìm bằng PowerShell
+**** Get-ChildItem HKCR:\CLSID
+**** Get-ItemProperty HKCR:\CLSID\{GUID}
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+* Làm quen với COM
+
+* Muốn dùng interface của một object
+** Khởi tạo COM: CoInitialize
+** Tạo object đúng loại object có interface đó: CoCreateInstance
+*** Ở hàm này, ta cũng có thể chỉ định trực tiếp loại interface muốn lấy.
+*** Khi thành công nó sẽ trả về con trỏ đến object đó.
+** Sử dụng QueryInterface để lấy interface mong muốn của object đó.
+*** Nó cũng có thể hiểu là: Lấy interface khác từ cùng object.
+*** Thành công thì nó trả về con trỏ đến interface đó.
+** Sau khi hoàn tất thì thực hiện Release tất cả
+
+
+
+
+* Lưu ý:
+** Tham số "dwClsContext" của "CoCreateInstance"
+*** CLSCTX_INPROC_SERVER: DLL trong cùng process
+*** CLSCTX_LOCAL_SERVER: EXE khác
+*** CLSCTX_REMOTE_SERVER: máy khác
+
+
+* Thắc mắc
+** CoCreateInstance nó sẽ tạo ra một COM object mà mình chỉ định ở tham số đầu tiên phải không?
+*** Giải thích: Nó trả về một con trỏ đến interface (thực chất là đến vtable của interface) nằm trong object.
+** Tôi biết với flag đó thì có nghĩa là "ShellLink nằm trong DLL của Windows" nhưng tôi không hiểu ShellLink nằm trong DLL của Windows là như thế nào?
+*** Giải thích: Có nghĩa chính là phần DLL nằm trong registry của các COM thường thấy, nó load dll đó vào memory của process hiện tại rồi thực  hiện gọi hàm và các interface trong dll đó.
+** Vậy CoCreateInstance nó trả về pointer tới object COM hay pointer tới interface truyền vào?
+*** Giải thích: Nó trả về pointer tới interface nằm trong object. Nên mọi lời gọi từ pointer tới interface thì nó đều dùng một con trỏ "this" con trỏ này chỉ có một là chính COM object hiện tại chứa interface đó.
+** Tôi đang học về COM cơ bản, nếu trong trường hợp lấy được con trỏ của interface thì thường sẽ làm gì tiếp theo?
+*** Giải thích: Sẽ thực hiện gọi các hàm của interface / object  hoặc các hàm mà nó định nghĩa. Muốn gọi các hàm của interface khác thì trước hết phải lấy con trỏ trỏ đến interface khác đó.
+** Đây KHÔNG phải object pointer, Đây là pointer tới vtable: Tôi là beginer nên không hiểu nhận định này là sao? Và vtable có nghĩa là gì?
+*** vtable (virtual table) nó là một table chứCa các con trỏ tới các hàm của một class COM object.
+** Thông thường khi gọi "CoCreateInstance", "QueryInterface" hay các hàm khác liên quan đến một COM thì nó tự động gọi "AddRef" hay sao mà nó tự động tăng ref count?
+*** Giải thích: Microsoft có định nghĩa rằng, nếu một hàm nào đó thực hiện trả về một pointer đến một interface thì reference count sẽ tự động tăng. Dễ hiểu hơn là bên trong các hàm đó đều có gọi "AddRef()"
+** Khi nào cần AddRef thủ công?
+*** Giải thích: Khi thực hiện copy pointer thì phải tự gọi "AddRef()" thủ công vì lúc này có 2 pointer giữ object.
+
+* Thắc mắc tiếp:
+** Nếu "CoCreateInstance" trả về pointer đến interface trong object thì làm sao mà "pShellLink->QueryInterface" lại có thể lấy được pointer đến một interface khác của object? Tôi chưa hiểu cơ chế chỗ này.
+** Pointer giữ object nghĩa là sao? Pointer trỏ đến interface của object mà sao lại trỏ đến object.
+*** Giải thích: Có nghĩa là khi gọi các hàm đó trả về pointer interface nằm trong object, khi hành động thực hiện với pointer interface đó thì cũng ở trong object.
+
+
+
+CoCreateInstance
+     |
+     v
+ref = 1
+
+QueryInterface(IPersistFile)
+     |
+     v
+ref = 2
+
+pPersistFile->Release()
+     |
+     v
+ref = 1
+
+pShellLink->Release()
+     |
+     v
+ref = 0
+
+Object destroyed
