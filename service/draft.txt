@@ -1,0 +1,764 @@
+#define _CRT_SECURE_NO_WARNINGS
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <wchar.h>
+#include <stdio.h>
+#include <sddl.h>
+#include <string>
+
+#pragma comment(lib, "advapi32.lib")
+
+static BOOL QueryMyServiceInfo(const wchar_t* SERVICE_NAME);
+
+void PrintLastError(const WCHAR* msg)
+{
+    DWORD err = GetLastError();
+    WCHAR buffer[512] = { 0 };
+
+    FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        buffer, 512, NULL
+    );
+
+    wprintf(L"%s failed. Error code: %u\n%s\n", msg, err, buffer);
+}
+bool EnableTakeOwnershipAndRestorePrivileges() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        PrintLastError(L"OpenProcessToken");
+        return false;
+    }
+
+    // Danh sách các privilege cần enable
+    const wchar_t* privileges[] = {
+        SE_TAKE_OWNERSHIP_NAME,   // SeTakeOwnershipPrivilege
+        SE_RESTORE_NAME,          // SeRestorePrivilege
+        SE_AUDIT_NAME,            // SeAuditPrivilege
+        SE_SECURITY_NAME          // SeSecurityPrivilege <-- thiếu cái này!
+    };
+
+    for (const wchar_t* privName : privileges) {
+        TOKEN_PRIVILEGES tp = {};
+        LUID luid;
+        if (!LookupPrivilegeValueW(nullptr, privName, &luid)) {
+            wprintf(L"LookupPrivilegeValueW failed for %s\n", privName);
+            continue;
+        }
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
+            wprintf(L"AdjustTokenPrivileges failed for %s\n", privName);
+        }
+        else {
+            wprintf(L"Enabled privilege: %s\n", privName);
+        }
+    }
+
+    CloseHandle(hToken);
+    return true;
+}
+
+
+// action create
+static BOOL CreateMyService(const wchar_t* SERVICE_NAME, const wchar_t* SERVICE_DISPLAY_NAME, const wchar_t* SERVICE_BINARY_PATH)
+{
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager");
+        return FALSE;
+    }
+
+    SC_HANDLE hService = CreateServiceW(
+        hSCManager,                     // handle SCM
+        SERVICE_NAME,                   // name service
+        SERVICE_DISPLAY_NAME,           // dsplay name
+        SERVICE_ALL_ACCESS,             // desired privilege
+        SERVICE_WIN32_OWN_PROCESS,      // type service
+        SERVICE_AUTO_START,             // start auto
+        SERVICE_ERROR_NORMAL,           // error default
+        SERVICE_BINARY_PATH,            // binary path
+        NULL, NULL, NULL, NULL, NULL    // other params
+    );
+
+    if (!hService)
+    {
+        PrintLastError(L"CreateService");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    wprintf(L"Create service '%s' success!\n", SERVICE_NAME);
+
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return TRUE;
+}
+
+const wchar_t* CheckStatusService(const wchar_t* service_name) {
+    const wchar_t* status = L"";
+
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager (start)");
+        return FALSE;
+    }
+
+    SC_HANDLE hService = OpenServiceW(hSCManager, service_name,
+        SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS);
+    if (!hService)
+    {
+        PrintLastError(L"OpenService (query)");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    // query status 
+    SERVICE_STATUS_PROCESS ssp = { 0 };
+    DWORD dwBytesNeeded = 0;
+    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
+        (LPBYTE)&ssp, sizeof(ssp), &dwBytesNeeded))
+    {
+        switch (ssp.dwCurrentState)
+        {
+        case SERVICE_STOPPED:          return L"Stopped";
+        case SERVICE_START_PENDING:    return L"Start Pending";
+        case SERVICE_STOP_PENDING:     return L"Stop Pending";
+        case SERVICE_RUNNING:          return L"Running";
+        case SERVICE_CONTINUE_PENDING: return L"Continue Pending";
+        case SERVICE_PAUSE_PENDING:    return L"Pause Pending";
+        case SERVICE_PAUSED:           return L"Paused";
+        default:                       return L"Unknown";
+        }
+    }
+    else
+    {
+        PrintLastError(L"QueryServiceStatusEx");
+    }
+    return L"Failed";
+}
+
+// action start
+static BOOL StartMyService(const wchar_t* SERVICE_NAME)
+{
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | GENERIC_EXECUTE);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager (start)");
+        return FALSE;
+    }
+
+    SC_HANDLE hService = OpenServiceW(hSCManager, SERVICE_NAME, SERVICE_START);
+    if (!hService)
+    {
+        PrintLastError(L"OpenService (start)");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    if (!StartServiceW(hService, 0, NULL))
+    {
+        PrintLastError(L"StartService");
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    wprintf(L"Requested start service '%s'.\n", SERVICE_NAME);
+
+    Sleep(1000);
+    wprintf(L"Checking status service (%s) is Running?\n", SERVICE_NAME);
+    const wchar_t* check = CheckStatusService(SERVICE_NAME);
+
+    if (_wcsicmp(check, L"Running") == 0) {
+        wprintf(L"Service started success!\n");
+    }
+    else {
+        wprintf(L"Service start failed! Now status is %s", check);
+    }
+
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return TRUE;
+}
+
+// action stop
+static BOOL StopMyService(const wchar_t* SERVICE_NAME)
+{
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager (stop)");
+        return FALSE;
+    }
+
+    SC_HANDLE hService = OpenServiceW(hSCManager, SERVICE_NAME, SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (!hService)
+    {
+        PrintLastError(L"OpenService (stop)");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    SERVICE_STATUS_PROCESS status;
+    DWORD bytesNeeded;
+    if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
+        (LPBYTE)&status, sizeof(status), &bytesNeeded))
+    {
+        PrintLastError(L"QueryServiceStatusEx");
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    if (status.dwCurrentState == SERVICE_STOPPED)
+    {
+        wprintf(L"Service '%s' stopped.\n", SERVICE_NAME);
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return TRUE;
+    }
+
+    if (!ControlService(hService, SERVICE_CONTROL_STOP, (LPSERVICE_STATUS)&status))
+    {
+        PrintLastError(L"ControlService (stop)");
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    wprintf(L"Requested stop service '%s'...\n", SERVICE_NAME);
+
+    Sleep(1000);
+    wprintf(L"Checking status service (%s) is stopped!\n", SERVICE_NAME);
+    const wchar_t* check = CheckStatusService(SERVICE_NAME);
+
+    if (_wcsicmp(check, L"Stopped") == 0) {
+        wprintf(L"Service stopped success!\n");
+    }
+    else {
+        wprintf(L"Service stopped failed! Now status is %s", check);
+    }
+
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return TRUE;
+}
+
+// action delete
+static BOOL DeleteMyService(const wchar_t* SERVICE_NAME)
+{
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager (delete)");
+        return FALSE;
+    }
+
+    SC_HANDLE hService = OpenServiceW(hSCManager, SERVICE_NAME, DELETE);
+    if (!hService)
+    {
+        PrintLastError(L"OpenService (delete)");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    if (!DeleteService(hService))
+    {
+        PrintLastError(L"DeleteService");
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    wprintf(L"Deleted service '%s' success!\n", SERVICE_NAME);
+
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return TRUE;
+}
+
+// Helper: Map SID string to friendly name
+std::wstring GetSidFriendlyName(const std::wstring& sidStr) {
+    if (sidStr == L"SY") return L"SYSTEM (Local System account)";
+    if (sidStr == L"BA") return L"BUILTIN\\Administrators";
+    if (sidStr == L"AU") return L"Authenticated Users";
+    if (sidStr == L"WD") return L"Everyone (World)";
+    if (sidStr == L"IU") return L"INTERACTIVE (Logged-on user)";
+    if (sidStr == L"SU") return L"SERVICE (Service logon)";
+
+    return L"Unknown SID: " + sidStr;
+}
+
+std::wstring GetServiceAccessRightsDesc(const std::wstring& rights) {
+    std::wstring desc;
+    if (rights.find(L"CC") != std::wstring::npos) desc += L"Create child (start service?), ";
+    if (rights.find(L"DC") != std::wstring::npos) desc += L"Delete child, ";
+    if (rights.find(L"LC") != std::wstring::npos) desc += L"List children, ";
+    if (rights.find(L"SW") != std::wstring::npos) desc += L"Self-write, ";
+    if (rights.find(L"RP") != std::wstring::npos) desc += L"Read property, ";
+    if (rights.find(L"WP") != std::wstring::npos) desc += L"Write property, ";
+    if (rights.find(L"DT") != std::wstring::npos) desc += L"Delete tree, ";
+    if (rights.find(L"LO") != std::wstring::npos) desc += L"List object, ";
+    if (rights.find(L"CR") != std::wstring::npos) desc += L"Control access (extended rights), ";
+    if (rights.find(L"SD") != std::wstring::npos) desc += L"Delete, ";
+    if (rights.find(L"RC") != std::wstring::npos) desc += L"Read control (view permissions), ";
+    if (rights.find(L"WD") != std::wstring::npos) desc += L"Write DAC (change permissions), ";
+    if (rights.find(L"WO") != std::wstring::npos) desc += L"Write owner (take ownership), ";
+    if (rights.find(L"FA") != std::wstring::npos) desc += L"Full access, ";
+    // Common service masks
+    if (rights == L"CCLCSWRPLORC") desc = L"Standard read/start/stop/query (typical for normal users)";
+    if (rights == L"CCDCLCSWRPWPDTLOCRSDRCWDWO") desc = L"Full control (start/stop/pause/change config/delete/take ownership/change perms)";
+    if (desc.empty()) desc = L"Custom/unknown rights: " + rights;
+    return desc;
+}
+
+
+std::wstring ParseAceFlags(const std::wstring& flags) {
+    std::wstring out;
+    if (flags.find(L"FA") != std::wstring::npos) out += L"Failure; ";
+    if (flags.find(L"SU") != std::wstring::npos) out += L"Success; ";
+    if (flags.find(L"SA") != std::wstring::npos) out += L"Success & Failure; ";
+    if (flags.find(L"CI") != std::wstring::npos) out += L"Container inherit; ";
+    if (flags.find(L"IO") != std::wstring::npos) out += L"Object inherit; ";
+    if (flags.find(L"NP") != std::wstring::npos) out += L"No propagate inherit; ";
+    if (flags.find(L"ID") != std::wstring::npos) out += L"Inherited; ";
+    return out.empty() ? L"(none)" : out;
+}
+
+std::wstring GetType(const std::wstring& type) {
+    if (type.find(L"A") != std::wstring::npos) return L"Allow ACE";
+    if (type.find(L"D") != std::wstring::npos) return L"Deny ACE";
+    if (type.find(L"AU") != std::wstring::npos) return L"Audit ACE";
+    return L"Unknown type";
+}
+
+void AnalyzeSDDL(const wchar_t* service_name, wchar_t* pSddl) {
+
+    wprintf(L"SDDL for service %s: %s\n\n", service_name, pSddl);
+
+    wprintf(L"Analyze detail security descriptor:\n");
+    wprintf(L"--------------------------------------------\n");
+
+    // Owner (O:)
+    std::wstring sddl = pSddl;
+
+    size_t posO = sddl.find(L"O:");
+    if (posO != std::wstring::npos) {
+        size_t endO = sddl.find(L"G:", posO);   // tim vi tri cua G: bat dau tu vi tri O:
+        if (endO == std::wstring::npos) {
+            endO = sddl.length();
+        }
+        std::wstring owner = sddl.substr(posO + 2, endO - posO - 2);
+        wprintf(L"Owner (O)\t\t: %s -> %s\n", owner, GetSidFriendlyName(owner).c_str());
+    }
+
+    // Group (G:)
+    int posG = sddl.find(L"G:");
+    if (posG != std::wstring::npos) {
+        size_t endG = sddl.find(L"D:", posG);
+        if (endG == std::wstring::npos) {
+            endG = sddl.length();
+        }
+
+        std::wstring group = sddl.substr(posG + 2, endG - posG - 2);
+        wprintf(L"Primary Group (G:)\t: %s -> %s\n", group, GetSidFriendlyName(group).c_str());
+    }
+
+    // DACL (D:)
+    size_t posD = sddl.find(L"D:");
+    if (posD != std::wstring::npos) {
+        std::wstring daclPart = sddl.substr(posD);      // lay het phan con lai bat dau tu vi tri D:
+        wprintf(L"++++++++++Permissions++++++++++++: \n");
+
+        // find ACE (A;;rights;;;SID)
+        size_t aceStart = daclPart.find(L"(");
+        int aceIndex = 1;
+        while (aceStart != std::wstring::npos && daclPart.substr(aceStart - 2, 2) != L"S:") {
+            size_t aceEnd = daclPart.find(L")", aceStart);
+            if (aceEnd == std::wstring::npos) {
+                break;
+            }
+            std::wstring ace = daclPart.substr(aceStart, aceEnd - aceStart + 1);
+            wprintf(L"ace dacl: %s\n", ace.c_str());
+
+            size_t rightsStart = ace.find(L";;") + 2;
+            size_t rightsEnd = ace.find(L";;;", rightsStart);
+            std::wstring rights = ace.substr(rightsStart, rightsEnd - rightsStart);
+
+            size_t sidStart = rightsEnd + 3;
+            size_t sidEnd = ace.find(L")", sidStart);
+            std::wstring sid = ace.substr(sidStart, sidEnd - sidStart);
+
+            wprintf(L"ACE thu %d\t: %s\n", aceIndex++, ace.c_str());
+            wprintf(L"  - Trustee\t: %s -> %s\n", sid, GetSidFriendlyName(sid).c_str());
+            wprintf(L"  - Rights\t: %s\n\n", GetServiceAccessRightsDesc(rights).c_str());
+
+            aceStart = daclPart.find(L"(", aceEnd);
+        }
+    }
+
+    // SACL (S:)
+    size_t posS = sddl.find(L"S:");
+    if (posS != std::wstring::npos) {
+        wprintf(L"check SACL\n");
+        std::wstring saclPart = sddl.substr(posS + 2);
+        wprintf(L"SACL (Audit):\n");
+
+        size_t aceStart = saclPart.find(L"(");
+        int aceCount = 1;
+        while (aceStart != std::wstring::npos) {
+            size_t aceEnd = saclPart.find(L")", aceStart);
+            if (aceEnd == std::wstring::npos) {
+                break;
+            }
+            std::wstring ace = saclPart.substr(aceStart, aceEnd - aceStart + 1);
+            wprintf(L"ace sacl: %s\n", ace.c_str());
+
+            size_t typeStart = aceStart + 1;
+            size_t typeEnd = saclPart.find(L";", typeStart);
+            std::wstring type = saclPart.substr(typeStart, typeEnd - typeStart);
+
+            size_t flagStart = typeEnd + 1;
+            size_t flagEnd = saclPart.find(L";", flagStart);
+            std::wstring flag = saclPart.substr(flagStart, flagEnd - flagStart);
+
+            const size_t rightStart = flagEnd + 1;
+            const size_t rightEnd = saclPart.find(L";;;", rightStart);
+            std::wstring right = saclPart.substr(rightStart, rightEnd - rightStart);
+
+            size_t sidStart = rightEnd + 3;
+            size_t sidEnd = saclPart.find(L")", sidStart);
+            std::wstring sid = saclPart.substr(sidStart, sidEnd - sidStart);
+            wprintf(L"type: %s\n", type.c_str());
+            wprintf(L"flag: %s\n", flag.c_str());
+            wprintf(L"sid: %s\n", sid.c_str());
+            wprintf(L"right: %s\n", right.c_str());
+
+            wprintf(L"start cua sid: %lu\n", sidStart);
+            wprintf(L"end cua sid: %lu\n", sidEnd);
+
+            wprintf(L"ACE thu %d\t: %s\n", aceCount++, ace.c_str());
+            wprintf(L"  - Audit type: %s\n", GetType(type).c_str());
+            wprintf(L"  - Flags: %s\n", ParseAceFlags(flag).c_str());
+            wprintf(L"  - Audit action: %s\n", GetServiceAccessRightsDesc(right).c_str());
+            wprintf(L"  - Trustee: %s\n", GetSidFriendlyName(sid).c_str());
+
+            aceStart = saclPart.find(L"(", aceEnd);
+        }
+    }
+    else {
+        wprintf(L"sacl failed\n");
+    }
+
+    wprintf(L"--------------------------------------------\n");
+
+}
+
+// demo set DACL, con Owner va Group thi giu nguyen (nhung cung co the duoc thay doi de dang)
+BOOL SetServiceBySDDL(const wchar_t* service_name, const wchar_t* setPart, const wchar_t* newDacl) {
+    // Mo SCM
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager");
+        return FALSE;
+    }
+
+    // Mo service voi quyen can thiet
+    SC_HANDLE hService = OpenServiceW(hSCManager, service_name,
+        SERVICE_CHANGE_CONFIG | WRITE_DAC | READ_CONTROL | SERVICE_QUERY_STATUS | WRITE_OWNER);
+    if (!hService)
+    {
+        PrintLastError(L"OpenService");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    // first, query to require buffer size
+    DWORD dwNeeded = 0;
+
+    if (!QueryServiceObjectSecurity(hService, SACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, NULL, 0, &dwNeeded)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            PrintLastError(L"QueryServiceObjectSecurity 1");
+        }
+    }
+
+    // Allocate buffer
+    BYTE* buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, dwNeeded);
+
+
+    if (!QueryServiceObjectSecurity(hService, SACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, buf, dwNeeded, &dwNeeded)) {
+        PrintLastError(L"QueryServiceObjectSecurity 2");
+    }
+
+    wchar_t* pSddl;
+    unsigned long sizeSddl = 0;
+    PSECURITY_DESCRIPTOR sd = (PSECURITY_DESCRIPTOR)buf;
+    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, SACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, &pSddl, &sizeSddl)) {
+        PrintLastError(L"ConvertSecurityDescriptorToStringSecurityDescriptorW");
+    }
+
+    std::wstring sddl = pSddl;
+
+    // Tach phan cua SDDL
+    std::wstring owner;
+    std::wstring group;
+    std::wstring dacl;
+    std::wstring sacl;
+
+
+    // tao 1 SDDL moi (thay DACL, giu Owner va Group)
+    wchar_t fullNewSddl[512];
+    PSECURITY_DESCRIPTOR pSD;
+    if (_wcsicmp(setPart, L"dacl") == 0) {
+        wsprintf(fullNewSddl, L"O:SYG:SY%s", newDacl);
+        wprintf(L"Full New SDDL: %s\n", fullNewSddl);
+    }
+    else if (_wcsicmp(setPart, L"owner") == 0) {
+        wsprintf(fullNewSddl, L"%sG:SYD:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)", newDacl);
+        wprintf(L"Full New SDDL: %s\n", fullNewSddl);
+    }
+    else if (_wcsicmp(setPart, L"group") == 0) {
+        wsprintf(fullNewSddl, L"O:SY%sD:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)", newDacl);
+        wprintf(L"Full New SDDL: %s\n", fullNewSddl);
+    }
+    else if (_wcsicmp(setPart, L"full") == 0) {
+        wsprintf(fullNewSddl, newDacl);
+        wprintf(L"Full New SDDL: %s\n", fullNewSddl);
+    }
+
+    // convert sddl string to byte
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        fullNewSddl, SDDL_REVISION_1, &pSD, NULL)) {
+        PrintLastError(L"Convert SDDL to SD");
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    // set dacl
+    if (!SetServiceObjectSecurity(hService, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, pSD)) {
+        PrintLastError(L"SetServiceObjectSecurity");
+        LocalFree(pSD);
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    LocalFree(pSD);
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return TRUE;
+}
+
+
+// action query
+static BOOL QueryMyServiceInfo(const wchar_t* SERVICE_NAME)
+{
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCManager)
+    {
+        PrintLastError(L"OpenSCManager (query)");
+        return FALSE;
+    }
+
+    SC_HANDLE hService = OpenServiceW(hSCManager, SERVICE_NAME,
+        SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL | ACCESS_SYSTEM_SECURITY);
+    if (!hService)
+    {
+        PrintLastError(L"OpenService (query)");
+        CloseServiceHandle(hSCManager);
+        return FALSE;
+    }
+
+    wprintf(L"\n=== Information detail of Service: %s ===\n", SERVICE_NAME);
+
+    // query status 
+    SERVICE_STATUS_PROCESS ssp = { 0 };
+    DWORD dwBytesNeeded = 0;
+    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
+        (LPBYTE)&ssp, sizeof(ssp), &dwBytesNeeded))
+    {
+        wprintf(L"Status\t\t: ");
+        switch (ssp.dwCurrentState)
+        {
+        case SERVICE_STOPPED:          wprintf(L"Stopped\n"); break;
+        case SERVICE_START_PENDING:    wprintf(L"Start Pending\n"); break;
+        case SERVICE_STOP_PENDING:     wprintf(L"Stop Pending\n"); break;
+        case SERVICE_RUNNING:          wprintf(L"Running\n"); break;
+        case SERVICE_CONTINUE_PENDING: wprintf(L"Continue Pending\n"); break;
+        case SERVICE_PAUSE_PENDING:    wprintf(L"Pause Pending\n"); break;
+        case SERVICE_PAUSED:           wprintf(L"Paused\n"); break;
+        default:                       wprintf(L"Unknown (%u)\n", ssp.dwCurrentState);
+        }
+
+        wprintf(L"PID\t\t: %u\n", ssp.dwProcessId);
+        wprintf(L"Exit code\t: %u\n", ssp.dwWin32ExitCode);
+        wprintf(L"Service flags\t: 0x%X\n", ssp.dwServiceFlags);
+    }
+    else
+    {
+        PrintLastError(L"QueryServiceStatusEx");
+    }
+
+    // query config
+    DWORD dwConfigSize = 8192;  // Buffer 
+    BYTE* pConfig = (BYTE*)HeapAlloc(GetProcessHeap(), 0, dwConfigSize);
+    if (pConfig && QueryServiceConfig2W(hService, SERVICE_CONFIG_DESCRIPTION,
+        pConfig, dwConfigSize, &dwBytesNeeded))
+    {
+        LPSERVICE_DESCRIPTIONW pDesc = (LPSERVICE_DESCRIPTIONW)pConfig;
+        wprintf(L"Description\t: %s\n", pDesc->lpDescription ? pDesc->lpDescription : L"(unknown)");
+    }
+
+    // Query binary path, start type, account...
+    if (pConfig && QueryServiceConfigW(hService, (LPQUERY_SERVICE_CONFIGW)pConfig,
+        dwConfigSize, &dwBytesNeeded))
+    {
+        LPQUERY_SERVICE_CONFIGW pQC = (LPQUERY_SERVICE_CONFIGW)pConfig;
+
+        wprintf(L"Type service\t: ");
+        switch (pQC->dwServiceType)
+        {
+        case SERVICE_WIN32_OWN_PROCESS:   wprintf(L"Win32 Own Process\n"); break;
+        case SERVICE_WIN32_SHARE_PROCESS: wprintf(L"Win32 Share Process\n"); break;
+        default:                          wprintf(L"Other (%u)\n", pQC->dwServiceType);
+        }
+
+        wprintf(L"Start type\t: ");
+        switch (pQC->dwStartType)
+        {
+        case SERVICE_AUTO_START:   wprintf(L"Automatic\n"); break;
+        case SERVICE_DEMAND_START: wprintf(L"Manual\n"); break;
+        case SERVICE_DISABLED:     wprintf(L"Disabled\n"); break;
+        case SERVICE_BOOT_START:   wprintf(L"Boot\n"); break;
+        case SERVICE_SYSTEM_START: wprintf(L"System\n"); break;
+        default:                   wprintf(L"Unknown (%u)\n", pQC->dwStartType);
+        }
+
+        wprintf(L"Binary path\t: %s\n", pQC->lpBinaryPathName ? pQC->lpBinaryPathName : L"(unknown)");
+        wprintf(L"Account\t\t: %s\n", pQC->lpServiceStartName ? pQC->lpServiceStartName : L"(unknown)");
+        wprintf(L"Display name\t: %s\n", pQC->lpDisplayName ? pQC->lpDisplayName : L"(unknown)");
+    }
+
+    // first, query to require buffer size
+    DWORD dwNeeded = 0;
+
+    if (!QueryServiceObjectSecurity(hService, SACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, NULL, 0, &dwNeeded)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            PrintLastError(L"QueryServiceObjectSecurity 1");
+        }
+    }
+
+    // Allocate buffer
+    BYTE* buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, dwNeeded);
+    //SECURITY_DESCRIPTOR sd = {};
+
+
+    if (!QueryServiceObjectSecurity(hService, SACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, buf, dwNeeded, &dwNeeded)) {
+        PrintLastError(L"QueryServiceObjectSecurity 2");
+    }
+
+    wchar_t* pSddl;
+    unsigned long sizeSddl = 0;
+    PSECURITY_DESCRIPTOR sd = (PSECURITY_DESCRIPTOR)buf;
+    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, SACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, &pSddl, &sizeSddl)) {
+        PrintLastError(L"ConvertSecurityDescriptorToStringSecurityDescriptorW");
+    }
+
+    wprintf(L"SDDL\t\t: %s\n", pSddl);
+    wprintf(L"SDDL (byte)\t: ");
+    for (DWORD i = 0; i < dwNeeded; i++) {
+        printf("%02X ", buf[i]);
+    }
+    printf("\n");
+    wprintf(L"=====================================\n");
+
+    AnalyzeSDDL(SERVICE_NAME, pSddl);
+
+    HeapFree(GetProcessHeap(), 0, buf);
+
+    HeapFree(GetProcessHeap(), 0, pConfig);
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+
+    return TRUE;
+}
+
+int wmain(int argc, wchar_t* argv[])
+{
+    EnableTakeOwnershipAndRestorePrivileges();
+
+    const wchar_t* action = L"";
+    const WCHAR* SERVICE_NAME = L"";
+    const WCHAR* SERVICE_DISPLAY_NAME = L"test service";
+    const WCHAR* SERVICE_BINARY_PATH = L"";
+
+    action = argv[1];
+    if (_wcsicmp(action, L"create") == 0) {
+        if (argc < 4) {
+            wprintf(L"Usage: %s <action> <name_service> <binary_path>:optional if action is create\n", argv[0]);
+            wprintf(L"action: create | start | stop | delete | query \n");
+            return 1;
+        }
+    }
+    if (argc < 3) {
+        wprintf(L"Usage: %s <action> <name_service> \n", argv[0]);
+        wprintf(L"action: start | stop | delete | query \n");
+        return 1;
+    }
+
+    if (_wcsicmp(argv[1], L"set") == 0) {
+        if (!SetServiceBySDDL(argv[2], argv[3], argv[4])) {
+            //wprintf(L"Set new SDDL faile");
+            PrintLastError(L"SetServiceBySDDL");
+
+            return 1;
+        }
+        wprintf(L"Set new SDDL success!\n");
+        wprintf(L"Check new SDDL success!\n");
+        QueryMyServiceInfo(argv[2]);
+        return 0;
+    }
+
+
+    SERVICE_NAME = argv[2];
+    SERVICE_BINARY_PATH = argv[3];
+    wprintf(L"Action: %s\n", action);
+
+
+    if (_wcsicmp(action, L"create") == 0) {
+        CreateMyService(SERVICE_NAME, SERVICE_DISPLAY_NAME, SERVICE_BINARY_PATH);
+    }
+    else if (_wcsicmp(action, L"start") == 0) {
+        StartMyService(SERVICE_NAME);
+    }
+    else if (_wcsicmp(action, L"delete") == 0) {
+        DeleteMyService(SERVICE_NAME);
+    }
+    else if (_wcsicmp(action, L"query") == 0) {
+        QueryMyServiceInfo(SERVICE_NAME);
+    }
+    else if (_wcsicmp(action, L"stop") == 0) {
+        StopMyService(SERVICE_NAME);
+    }
+    else {
+        wprintf(L"action unknown!\n");
+        return 1;
+    }
+
+    return 0;
+}
