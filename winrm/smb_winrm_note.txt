@@ -1,0 +1,160 @@
+Hàm WSManCreateShell là một API của Windows dùng để tạo một “remote shell session” trên máy đích thông qua WinRM.
+Hiểu đơn giản: nó mở một môi trường để bạn có thể chạy lệnh từ xa (giống như mở cmd.exe trên máy khác).
+
+
+Sau khi shell được tạo, bạn có thể dùng các API khác để:
+
+WSManRunShellCommand   → chạy lệnh
+WSManReceiveShellOutput → đọc output
+WSManSignalShell        → dừng command
+
+Khi gọi WSManCreateShell:
+tool.exe
+   │
+   │ HTTP request
+   ▼
+WinRM service (remote)
+   │
+   │ spawn shell
+   ▼
+cmd.exe
+
+Sau đó server trả về: shell ID
+
+
+3️⃣ Shell là gì trong WinRM
+
+Shell không chỉ là process.
+
+Nó là context để chạy command.
+
+Context gồm:
+
+working directory
+environment variables
+stdin
+stdout
+stderr
+timeout
+
+
+Điều xảy ra bên trong WSManCreateShell
+Bước 1
+Serialize request thành SOAP XML.
+Ví dụ:
+
+<CreateShell>
+  <InputStreams>stdin</InputStreams>
+  <OutputStreams>stdout stderr</OutputStreams>
+</CreateShell>
+
+Bước 2
+
+Gửi HTTP request tới:
+
+http://target:5985/wsman
+
+Bước 3
+
+Remote WinRM service nhận request.
+
+WinRM
+
+Nó gọi subsystem:
+
+WinRS
+
+
+Bước 4
+
+WinRS spawn process:
+
+cmd.exe
+Bước 5
+
+Server tạo shell object.
+
+Ví dụ:
+
+ShellId = 7C2D...
+Bước 6
+
+Server gửi SOAP response.
+
+Bước 7
+
+Client nhận response.
+
+WinRM client thread gọi:
+
+OnShellCreated callback
+
+
+
+1 gửi request tới WinRM server
+2 yêu cầu tạo shell
+3 server spawn cmd.exe
+4 server trả shell ID
+5 callback được gọi
+6 bạn nhận shell handle
+
+
+
+syntax đặt trong {} là để Giới hạn tầm vực (scope) của biến, các biến chỉ tồn tại bên trong {}, khi ra khỏi {} thì các biến tự động biến mất.
+
+
+*********************************************
+Windows không định nghĩa “cùng một server” bằng IP thật hay máy thật, mà định nghĩa bằng chuỗi tên server (server name string) bạn nhập trong UNC path.
+
+Cơ chế nội bộ (SMB Redirector + MUP - Multiple UNC Provider):
+
+Khi bạn chạy net use \\tên\share /user:xxx yyy
+→ Windows tạo một SMB session và lưu vào bảng nội bộ, key = chính chuỗi “tên” (không phải IP sau khi resolve).
+Mọi lần truy cập sau (dir, copy, Explorer, app…) đều phải chỉ ra UNC path hoặc drive letter.
+Windows làm như sau:
+Lấy chuỗi server name từ path bạn đang dùng (ví dụ: \\192.168.17.36 hoặc \\DESKTOP-LVFA3FH).
+Tìm trong bảng session xem có session nào khớp chuỗi chính xác không.
+Nếu tìm thấy → lấy ngay credential + Session ID của session đó.
+Dùng credential đó để gửi trong gói tin SMB (Session Setup / Tree Connect).
+
+
+→ Vì vậy:
+
+Dùng \\192.168.17.36\... hoặc drive Z: → luôn lấy credential Administrator / P@ssw0rd123
+Dùng \\DESKTOP-LVFA3FH\... hoặc drive G: → luôn lấy credential normal / normal
+
+Dù hai chuỗi này resolve ra cùng IP, gói tin SMB vẫn mang credential riêng (bạn có thể bắt Wireshark để thấy rõ: NTLMSSP_AUTH hoặc Kerberos ticket khác nhau).
+
+
+Ví dụ 2 – Dùng DNS alias / hosts file (cách Microsoft gợi ý thứ 2):
+Thêm dòng vào C:\Windows\System32\drivers\etc\hosts:
+text192.168.17.36   fake-server-alias
+Sau đó:
+cmdnet use \\DESKTOP-LVFA3FH\shared /user:normal normal          ← credential 1
+net use \\fake-server-alias\shared /user:Administrator P@ssw0rd123   ← credential 2
+→ Windows coi fake-server-alias là “server khác” hoàn toàn.
+
+Ví dụ 3 – Dùng nhiều alias (có thể tạo 3-4 credential khác nhau):
+Thêm vào hosts:
+text192.168.17.36   server1
+192.168.17.36   server2
+192.168.17.36   server3
+Rồi map 3 drive với 3 user khác nhau.
+Tóm lại: Credential được chọn hoàn toàn dựa vào chuỗi tên bạn dùng trong path, không phải IP thật. Đây là lý do Microsoft chính thức khuyến nghị dùng IP hoặc alias để bypass lỗi 1219.
+
+
+
+PS C:\Windows\system32> Get-SmbConnection | Select ServerName, UserName, ShareName
+
+ServerName      UserName                  ShareName
+----------      --------                  ---------
+192.168.17.36   DESKTOP-EKHNQ7E\win10test IPC$
+192.168.17.36   DESKTOP-EKHNQ7E\win10test shared
+DESKTOP-LVFA3FH DESKTOP-EKHNQ7E\win10test IPC$
+DESKTOP-LVFA3FH DESKTOP-EKHNQ7E\win10test shared
+server1         DESKTOP-EKHNQ7E\win10test shared
+
+
+PS C:\Windows\system32>
+
+hoặc bắt Wireshark filter smb2 để thấy credential trong từng gói tin.
