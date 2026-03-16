@@ -1,0 +1,531 @@
+#define WSMAN_API_VERSION_1_1
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <wsman.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <strsafe.h>
+
+#pragma comment(lib, "Wsmsvc.lib")
+
+#define SENTINEL_FMT "__END_%lu__"
+
+// ─────────────────────────────────────────────────────────────
+// Structs
+// ─────────────────────────────────────────────────────────────
+typedef struct {
+    HANDLE  hEvent;
+    HRESULT hr;
+    WSMAN_SHELL_HANDLE   hShell;
+    WSMAN_COMMAND_HANDLE hCommand;
+
+    // Accumulated output across ALL cbRecv calls for one logical receive session
+    char*  pData;
+    DWORD  cbData;
+
+    BOOL   bEndOfOp;   // set when WSMAN_FLAG_CALLBACK_END_OF_OPERATION fires
+    BOOL   bDone;      // command state = Done
+    DWORD  exitCode;
+} CTX;
+
+typedef struct {
+    WSMAN_API_HANDLE     hAPI;
+    WSMAN_SESSION_HANDLE hSession;
+} CONN;
+
+typedef struct {
+    CTX*   ctx;
+    char   sentinel[64];
+    WCHAR  cwd[512];
+    DWORD  sentinelId;
+} SHELL_B;
+
+// ─────────────────────────────────────────────────────────────
+// Buffer helper
+// ─────────────────────────────────────────────────────────────
+static BOOL BufAppend(char** ppBuf, DWORD* pcbBuf, const BYTE* src, DWORD srcLen)
+{
+    if (!src || !srcLen) return TRUE;
+    char* tmp = (char*)realloc(*ppBuf, *pcbBuf + srcLen + 1);
+    if (!tmp) return FALSE;
+    *ppBuf = tmp;
+    memcpy(*ppBuf + *pcbBuf, src, srcLen);
+    *pcbBuf += srcLen;
+    (*ppBuf)[*pcbBuf] = '\0';
+    return TRUE;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Callbacks
+// ─────────────────────────────────────────────────────────────
+void CALLBACK cbShell(
+    PVOID ctx, DWORD, WSMAN_ERROR* err,
+    WSMAN_SHELL_HANDLE hShell,
+    WSMAN_COMMAND_HANDLE, WSMAN_OPERATION_HANDLE, WSMAN_RESPONSE_DATA*)
+{
+    CTX* c = (CTX*)ctx;
+    c->hr = (err && err->code) ? HRESULT_FROM_WIN32(err->code) : S_OK;
+    if (SUCCEEDED(c->hr)) c->hShell = hShell;
+    SetEvent(c->hEvent);
+}
+
+void CALLBACK cbCmd(
+    PVOID ctx, DWORD, WSMAN_ERROR* err,
+    WSMAN_SHELL_HANDLE, WSMAN_COMMAND_HANDLE hCmd,
+    WSMAN_OPERATION_HANDLE, WSMAN_RESPONSE_DATA*)
+{
+    CTX* c = (CTX*)ctx;
+    c->hr = (err && err->code) ? HRESULT_FROM_WIN32(err->code) : S_OK;
+    if (SUCCEEDED(c->hr)) c->hCommand = hCmd;
+    SetEvent(c->hEvent);
+}
+
+// KEY INSIGHT: cbRecv can fire MULTIPLE TIMES per WSManReceiveShellOutput call.
+// WinRM delivers data in several partial callbacks before END_OF_OPERATION.
+// Accumulate ALL chunks here; only signal hEvent on END_OF_OPERATION.
+void CALLBACK cbRecv(
+    PVOID ctx, DWORD flags, WSMAN_ERROR* err,
+    WSMAN_SHELL_HANDLE, WSMAN_COMMAND_HANDLE,
+    WSMAN_OPERATION_HANDLE, WSMAN_RESPONSE_DATA* data)
+{
+    CTX* c = (CTX*)ctx;
+
+    if (err && err->code) {
+        c->hr       = HRESULT_FROM_WIN32(err->code);
+        c->bEndOfOp = TRUE;
+        SetEvent(c->hEvent);
+        return;
+    }
+
+    if (data) {
+        WSMAN_RECEIVE_DATA_RESULT* r = &data->receiveData;
+
+        if (r->commandState &&
+            wcscmp(r->commandState, WSMAN_COMMAND_STATE_DONE) == 0)
+        {
+            c->bDone    = TRUE;
+            c->exitCode = r->exitCode;
+        }
+
+        DWORD len = r->streamData.binaryData.dataLength;
+        BYTE* src = r->streamData.binaryData.data;
+        if (len > 0 && src)
+            BufAppend(&c->pData, &c->cbData, src, len);
+    }
+
+    // Signal ONLY after the entire receive operation completes
+    if (flags & WSMAN_FLAG_CALLBACK_END_OF_OPERATION) {
+        c->hr       = S_OK;
+        c->bEndOfOp = TRUE;
+        SetEvent(c->hEvent);
+    }
+}
+
+void CALLBACK cbSend(
+    PVOID ctx, DWORD flags, WSMAN_ERROR* err,
+    WSMAN_SHELL_HANDLE, WSMAN_COMMAND_HANDLE,
+    WSMAN_OPERATION_HANDLE, WSMAN_RESPONSE_DATA*)
+{
+    CTX* c = (CTX*)ctx;
+    c->hr = (err && err->code) ? HRESULT_FROM_WIN32(err->code) : S_OK;
+    if (flags & WSMAN_FLAG_CALLBACK_END_OF_OPERATION)
+        SetEvent(c->hEvent);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Connect / Disconnect
+// ─────────────────────────────────────────────────────────────
+static HRESULT Connect(CONN* conn, LPCWSTR ip, LPCWSTR user, LPCWSTR pass)
+{
+    ZeroMemory(conn, sizeof(*conn));
+
+    HRESULT hr = WSManInitialize(WSMAN_FLAG_REQUESTED_API_VERSION_1_1, &conn->hAPI);
+    if (FAILED(hr)) return hr;
+
+    WSMAN_USERNAME_PASSWORD_CREDS creds   = { (LPWSTR)user, (LPWSTR)pass };
+    WSMAN_AUTHENTICATION_CREDENTIALS auth = { 0 };
+    auth.authenticationMechanism = WSMAN_FLAG_AUTH_NEGOTIATE;
+    auth.userAccount             = creds;
+
+    WCHAR url[256];
+    StringCchPrintfW(url, _countof(url), L"http://%s:5985/wsman", ip);
+
+    hr = WSManCreateSession(conn->hAPI, url, 0, &auth, NULL, &conn->hSession);
+    return hr;
+}
+
+static void Disconnect(CONN* conn)
+{
+    if (conn->hSession) WSManCloseSession(conn->hSession, 0);
+    if (conn->hAPI)     WSManDeinitialize(conn->hAPI, 0);
+    ZeroMemory(conn, sizeof(*conn));
+}
+
+// ─────────────────────────────────────────────────────────────
+// SendInput
+// ─────────────────────────────────────────────────────────────
+static HRESULT SendInput(CTX* ctx, const char* text, DWORD len)
+{
+    ResetEvent(ctx->hEvent);
+
+    WSMAN_DATA d = { 0 };
+    d.type                  = WSMAN_DATA_TYPE_BINARY;
+    d.binaryData.data       = (BYTE*)text;
+    d.binaryData.dataLength = len;
+
+    WSMAN_SHELL_ASYNC      a  = { ctx, cbSend };
+    WSMAN_OPERATION_HANDLE hOp = NULL;
+
+    WSManSendShellInput(ctx->hShell, ctx->hCommand, 0, L"stdin",
+                        &d, FALSE, &a, &hOp);
+
+    DWORD   w  = WaitForSingleObject(ctx->hEvent, 15000);
+    HRESULT hr = (w == WAIT_TIMEOUT) ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : ctx->hr;
+    if (hOp) WSManCloseOperation(hOp, 0);
+    return hr;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DoOneReceive
+//
+// Issues ONE WSManReceiveShellOutput call and waits until
+// END_OF_OPERATION fires (cbRecv accumulates all partial chunks).
+// After return, newly received bytes are in ctx->pData/cbData.
+// ─────────────────────────────────────────────────────────────
+static HRESULT DoOneReceive(CTX* ctx, DWORD timeout_ms)
+{
+    // Clear previous receive buffer and state flags
+    if (ctx->pData) { free(ctx->pData); ctx->pData = NULL; ctx->cbData = 0; }
+    ctx->bEndOfOp = FALSE;
+    ctx->hr       = S_OK;
+    ResetEvent(ctx->hEvent);
+
+    PCWSTR streams[] = { L"stdout", L"stderr" };
+    WSMAN_STREAM_ID_SET ss = { _countof(streams), streams };
+
+    WSMAN_SHELL_ASYNC      a  = { ctx, cbRecv };
+    WSMAN_OPERATION_HANDLE hOp = NULL;
+
+    WSManReceiveShellOutput(ctx->hShell, ctx->hCommand, 0, &ss, &a, &hOp);
+
+    DWORD w = WaitForSingleObject(ctx->hEvent, timeout_ms);
+
+    if (hOp) WSManCloseOperation(hOp, 0);
+
+    if (w == WAIT_TIMEOUT) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    return ctx->hr;
+}
+
+// ─────────────────────────────────────────────────────────────
+// RecvUntilSentinel
+//
+// Calls DoOneReceive in a loop, appending each round's data into
+// a total buffer, until the sentinel appears or timeout/error.
+// ─────────────────────────────────────────────────────────────
+static HRESULT RecvUntilSentinel(CTX* ctx, const char* sentinel,
+                                  char** ppOut, DWORD* pcbOut)
+{
+    char*   total   = NULL;
+    DWORD   cbTotal = 0;
+    HRESULT hr      = S_OK;
+    int     maxLoops = 60;  // 60 × 10s = 10 min hard limit
+
+    while (maxLoops-- > 0)
+    {
+        hr = DoOneReceive(ctx, 10000);
+
+        // Hard error (not timeout) → abort
+        if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_TIMEOUT))
+            break;
+
+        // Append new data to total buffer
+        if (ctx->pData && ctx->cbData > 0)
+            BufAppend(&total, &cbTotal, (BYTE*)ctx->pData, ctx->cbData);
+
+        // Search for sentinel
+        if (total) {
+            char* pos = strstr(total, sentinel);
+            if (pos) {
+                *pos    = '\0';
+                cbTotal = (DWORD)(pos - total);
+                // Trim trailing CR/LF
+                while (cbTotal > 0 &&
+                       (total[cbTotal-1] == '\r' || total[cbTotal-1] == '\n'))
+                    total[--cbTotal] = '\0';
+                hr = S_OK;
+                break;
+            }
+        }
+
+        if (ctx->bDone) break;
+    }
+
+    *ppOut  = total;
+    *pcbOut = cbTotal;
+    return hr;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Print — UTF-8 bytes → WriteConsoleW
+// ─────────────────────────────────────────────────────────────
+static void Print(const char* buf, DWORD cb)
+{
+    if (!buf || !cb) return;
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, buf, (int)cb, NULL, 0);
+    if (wlen <= 0) { fwrite(buf, 1, cb, stdout); fflush(stdout); return; }
+
+    WCHAR* wide = (WCHAR*)malloc((wlen + 1) * sizeof(WCHAR));
+    if (!wide) { fwrite(buf, 1, cb, stdout); fflush(stdout); return; }
+
+    MultiByteToWideChar(CP_UTF8, 0, buf, (int)cb, wide, wlen);
+    wide[wlen] = L'\0';
+
+    DWORD written = 0;
+    WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), wide, (DWORD)wlen, &written, NULL);
+    free(wide);
+}
+
+// ─────────────────────────────────────────────────────────────
+// ParseCwd
+// ─────────────────────────────────────────────────────────────
+static void ParseCwd(const char* out, DWORD cb, WCHAR* cwd, int cwdLen)
+{
+    if (!out || !cb) return;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, out, (int)cb, NULL, 0);
+    if (wlen <= 0) return;
+    WCHAR* wide = (WCHAR*)calloc(wlen + 1, sizeof(WCHAR));
+    if (!wide) return;
+    MultiByteToWideChar(CP_UTF8, 0, out, (int)cb, wide, wlen);
+    for (int i = wlen - 1; i >= 0; i--) {
+        if (wide[i] == L'\r' || wide[i] == L'\n' || wide[i] == L' ')
+            wide[i] = L'\0';
+        else break;
+    }
+    if (wide[0]) StringCchCopyW(cwd, cwdLen, wide);
+    free(wide);
+}
+
+// ─────────────────────────────────────────────────────────────
+// ExecCmd
+// ─────────────────────────────────────────────────────────────
+static HRESULT ExecCmd(SHELL_B* sh, LPCWSTR userCmd, char** ppOut, DWORD* pcbOut)
+{
+    sh->sentinelId++;
+    StringCchPrintfA(sh->sentinel, _countof(sh->sentinel), SENTINEL_FMT, sh->sentinelId);
+
+    char cmdUTF8[2048] = { 0 };
+    WideCharToMultiByte(CP_UTF8, 0, userCmd, -1, cmdUTF8, (int)sizeof(cmdUTF8)-1, NULL, NULL);
+
+    char input[4096];
+    int inputLen = _snprintf_s(input, sizeof(input), _TRUNCATE,
+        "%s\r\necho %s\r\n", cmdUTF8, sh->sentinel);
+    if (inputLen < 0) return E_INVALIDARG;
+
+    HRESULT hr = SendInput(sh->ctx, input, (DWORD)inputLen);
+    if (FAILED(hr)) return hr;
+
+    hr = RecvUntilSentinel(sh->ctx, sh->sentinel, ppOut, pcbOut);
+
+    // Update cwd silently
+    if (SUCCEEDED(hr)) {
+        sh->sentinelId++;
+        StringCchPrintfA(sh->sentinel, _countof(sh->sentinel), SENTINEL_FMT, sh->sentinelId);
+        char cdInput[256];
+        int cdLen = _snprintf_s(cdInput, sizeof(cdInput), _TRUNCATE,
+            "cd\r\necho %s\r\n", sh->sentinel);
+        SendInput(sh->ctx, cdInput, (DWORD)cdLen);
+        char* cwdOut = NULL; DWORD cwdCb = 0;
+        RecvUntilSentinel(sh->ctx, sh->sentinel, &cwdOut, &cwdCb);
+        if (cwdOut) { ParseCwd(cwdOut, cwdCb, sh->cwd, _countof(sh->cwd)); free(cwdOut); }
+    }
+
+    return hr;
+}
+
+// ─────────────────────────────────────────────────────────────
+// StartShell
+// ─────────────────────────────────────────────────────────────
+static HRESULT StartShell(CONN* conn, SHELL_B* sh)
+{
+    ZeroMemory(sh, sizeof(*sh));
+
+    CTX* ctx = (CTX*)calloc(1, sizeof(CTX));
+    if (!ctx) return E_OUTOFMEMORY;
+
+    ctx->hEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!ctx->hEvent) { free(ctx); return E_FAIL; }
+
+    sh->ctx        = ctx;
+    sh->sentinelId = (DWORD)(GetTickCount64() & 0xFFFFFFFF);
+
+    HRESULT hr = S_OK;
+
+    // 1. Create shell
+    {
+        WSMAN_SHELL_ASYNC a = { ctx, cbShell };
+        WSManCreateShell(conn->hSession, 0,
+            L"http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd",
+            NULL, NULL, NULL, &a, &ctx->hShell);
+        hr = (WaitForSingleObject(ctx->hEvent, 20000) == WAIT_TIMEOUT)
+             ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : ctx->hr;
+        if (FAILED(hr)) goto cleanup;
+    }
+
+    // 2. Run cmd.exe
+    {
+        ResetEvent(ctx->hEvent);
+        WSMAN_SHELL_ASYNC a = { ctx, cbCmd };
+        WSManRunShellCommand(ctx->hShell, 0, L"cmd.exe", NULL, NULL, &a, &ctx->hCommand);
+        hr = (WaitForSingleObject(ctx->hEvent, 20000) == WAIT_TIMEOUT)
+             ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : ctx->hr;
+        if (FAILED(hr)) goto cleanup;
+    }
+
+    Sleep(500);
+
+    // 3. Setup: UTF-8 codepage + silent prompt
+    {
+        const char setup[] = "chcp 65001 >nul 2>&1\r\n@echo off\r\nprompt $P$G\r\n";
+        SendInput(ctx, setup, (DWORD)strlen(setup));
+        Sleep(400);
+    }
+
+    // 4. Flush banner
+    {
+        sh->sentinelId++;
+        StringCchPrintfA(sh->sentinel, _countof(sh->sentinel), SENTINEL_FMT, sh->sentinelId);
+        char flush[128];
+        int len = _snprintf_s(flush, sizeof(flush), _TRUNCATE, "echo %s\r\n", sh->sentinel);
+        SendInput(ctx, flush, len);
+        char* banner = NULL; DWORD bCb = 0;
+        RecvUntilSentinel(ctx, sh->sentinel, &banner, &bCb);
+        if (banner) free(banner);
+    }
+
+    // 5. Get initial cwd
+    {
+        sh->sentinelId++;
+        StringCchPrintfA(sh->sentinel, _countof(sh->sentinel), SENTINEL_FMT, sh->sentinelId);
+        char cdCmd[128];
+        int cdLen = _snprintf_s(cdCmd, sizeof(cdCmd), _TRUNCATE,
+            "cd\r\necho %s\r\n", sh->sentinel);
+        SendInput(ctx, cdCmd, cdLen);
+        char* cwdOut = NULL; DWORD cwdCb = 0;
+        RecvUntilSentinel(ctx, sh->sentinel, &cwdOut, &cwdCb);
+        if (cwdOut) { ParseCwd(cwdOut, cwdCb, sh->cwd, _countof(sh->cwd)); free(cwdOut); }
+    }
+
+    if (sh->cwd[0] == L'\0')
+        StringCchCopyW(sh->cwd, _countof(sh->cwd), L"C:\\");
+
+cleanup:
+    if (FAILED(hr)) {
+        if (ctx->hShell) WSManCloseShell(ctx->hShell, 0, NULL);
+        if (ctx->hEvent) CloseHandle(ctx->hEvent);
+        if (ctx->pData)  free(ctx->pData);
+        free(ctx);
+        sh->ctx = NULL;
+    }
+    return hr;
+}
+
+static void StopShell(SHELL_B* sh)
+{
+    if (!sh->ctx) return;
+    CTX* ctx = sh->ctx;
+    SendInput(ctx, "exit\r\n", 6);
+    if (ctx->hCommand) WSManCloseCommand(ctx->hCommand, 0, NULL);
+    if (ctx->hShell)   WSManCloseShell(ctx->hShell,   0, NULL);
+    if (ctx->pData)    free(ctx->pData);
+    if (ctx->hEvent)   CloseHandle(ctx->hEvent);
+    free(ctx);
+    sh->ctx = NULL;
+}
+
+// ─────────────────────────────────────────────────────────────
+// RunShell
+// ─────────────────────────────────────────────────────────────
+static void RunShell(CONN* conn)
+{
+    SHELL_B sh = { 0 };
+
+    wprintf(L"Starting remote cmd.exe...\n");
+    HRESULT hr = StartShell(conn, &sh);
+    if (FAILED(hr)) {
+        WCHAR msg[512] = { 0 };
+        FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, NULL, hr, 0, msg, _countof(msg), NULL);
+        wprintf(L"StartShell failed: 0x%08X - %s\n", (UINT)hr, msg);
+        return;
+    }
+
+    wprintf(L"Connected. Type commands (exit/quit to end).\n\n");
+
+    WCHAR line[1024];
+    while (TRUE) {
+        wprintf(L"%s> ", sh.cwd);
+        fflush(stdout);
+
+        if (!fgetws(line, _countof(line), stdin)) break;
+        line[wcscspn(line, L"\r\n")] = L'\0';
+        if (line[0] == L'\0') continue;
+        if (_wcsicmp(line, L"exit") == 0 || _wcsicmp(line, L"quit") == 0) break;
+
+        char*  output = NULL;
+        DWORD  outLen = 0;
+
+        hr = ExecCmd(&sh, line, &output, &outLen);
+
+        if (FAILED(hr)) {
+            wprintf(L"[Error: 0x%08X]\n", (UINT)hr);
+            if (sh.ctx && sh.ctx->bDone) {
+                wprintf(L"Shell exited. Restarting...\n");
+                StopShell(&sh);
+                if (FAILED(StartShell(conn, &sh))) {
+                    wprintf(L"Restart failed. Exiting.\n");
+                    if (output) free(output);
+                    break;
+                }
+            }
+        } else if (output && outLen > 0) {
+            Print(output, outLen);
+            wprintf(L"\n");
+        }
+
+        if (output) free(output);
+    }
+
+    StopShell(&sh);
+    wprintf(L"\nSession ended.\n");
+}
+
+// ─────────────────────────────────────────────────────────────
+// wmain
+// ─────────────────────────────────────────────────────────────
+int wmain(int argc, WCHAR* argv[])
+{
+    SetConsoleOutputCP(CP_UTF8);
+
+    if (argc != 4) {
+        wprintf(L"Usage: %s <target-ip> <username> <password>\n", argv[0]);
+        return 1;
+    }
+
+    CONN conn = { 0 };
+    wprintf(L"Connecting to %s ...\n", argv[1]);
+
+    HRESULT hr = Connect(&conn, argv[1], argv[2], argv[3]);
+    if (FAILED(hr)) {
+        WCHAR msg[512] = { 0 };
+        FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, NULL, hr, 0, msg, _countof(msg), NULL);
+        wprintf(L"Connect failed: 0x%08X - %s\n", (UINT)hr, msg);
+        return 1;
+    }
+
+    RunShell(&conn);
+    Disconnect(&conn);
+    return 0;
+}
