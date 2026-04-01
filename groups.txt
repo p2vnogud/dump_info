@@ -1,0 +1,224 @@
+Những nhóm này không phải là nhóm thông thường (như group bạn tự tạo trong Active Directory). Chúng là special identities mà Windows tự động thêm vào access token (token quyền) của process/user dựa trên kiểu logon (logon type) và ngữ cảnh.	
+
+
+* SY – NT AUTHORITY\SYSTEM
+** Tài khoản hệ thống cao nhất của Windows (Local System account). Không phải user thật, là pseudo-account do kernel sử dụng.
+** Thành viên:
+*** Tất cả process chạy dưới Local System context.
+*** Hầu hết các Windows Service quan trọng (System, Winlogon, LSASS, SMSS…).
+*** Không bao giờ có user thật nào thuộc nhóm này (kể cả Administrator).
+** Quyền và vai trò: Toàn quyền trên hệ thống.
+
+* BA – BUILTIN\Administrators
+** Nhóm Quản trị viên cục bộ (local Administrators group).
+** Thành viên:
+*** Tài khoản Administrator mặc định.
+*** Bất kỳ user nào được thêm vào nhóm Administrators (local hoặc Domain Admins nếu máy join domain).
+*** Khi UAC bật, token của admin có 2 phiên bản: “filtered” (bình thường) và “elevated” (có BA).
+** Quyền và vai trò:
+*** Full control hầu hết objects trên máy.
+*** Cài phần mềm, thay đổi setting hệ thống, quản lý service, registry, file system…
+*** Khi elevated → gần như ngang SY (chỉ thiếu một số privilege đặc biệt của SYSTEM).
+
+* AU – Authenticated Users
+** Nhóm tất cả người dùng đã xác thực (đăng nhập bằng mật khẩu).
+** Thành viên:
+*** Tất cả logon có authentication (local account, domain account, Microsoft account).
+*** Bao gồm Interactive, Network, Batch, Service… (trừ Anonymous/Guest).
+** Quyền và vai trò
+*** Được cấp quyền Read/Execute mặc định trên rất nhiều folder, registry key (ví dụ: Program Files, Windows folder).
+*** Đây là nhóm phổ biến nhất để cấp quyền cho “user bình thường đã login”.
+** Lưu ý: Rất hay dùng trong ACL để cho phép “ai cũng đã login thì được dùng”.
+
+* WD – Everyone (hay World)
+** Nhóm “Mọi người” (trước Windows Vista bao gồm cả Anonymous).
+** Thành viên
+*** Từ Windows Vista trở đi: Gần tương đương Authenticated Users + một số service/system account.
+*** Không còn bao gồm Anonymous nữa (để tăng bảo mật).
+** Quyền và vai trò:
+*** Thường chỉ được cấp quyền Read (đôi khi Write) trên các tài nguyên công cộng.
+*** Dùng để cấp quyền rộng rãi nhất mà vẫn an toàn hơn Anonymous.
+** Lưu ý: Nhiều người nhầm tưởng WD = tất cả (kể cả hacker), nhưng thực tế đã bị hạn chế mạnh.
+
+* IU – INTERACTIVE
+** Nhóm “Người dùng tương tác” (Interactive logon).
+** Thành viên:
+*** Logon type: 2 (console), 7 (RDP unlock), 10 (Remote Interactive/RDP).
+*** Tức là người đang ngồi trước máy hoặc kết nối Remote Desktop.
+** Quyền và vai trò:
+*** Được cấp quyền truy cập các tài nguyên local (clipboard, desktop, window station).
+*** Nhiều ACL cho phép IU đọc/ghi để người dùng tương tác bình thường.
+** Lưu ý: Không bao gồm kết nối network thuần túy (logon type 3).
+
+* SU – SERVICE
+** Nhóm tất cả các Windows Service.
+** Thành viên
+*** Tất cả process chạy với logon type 5 (Service logon).
+*** Bao gồm cả LocalSystem, NetworkService, LocalService, và các service chạy dưới tài khoản user.
+** Quyền và vai trò
+*** Được phép chạy dưới dạng service (SeServiceLogonRight).
+*** Thường có quyền hạn chế hơn SYSTEM nhưng vẫn cao (đọc registry, file system…).
+** Lưu ý: Rất quan trọng khi viết service hoặc debug quyền của service.
+
+* NS – NETWORK SERVICE
+** Tài khoản service tích hợp (built-in), dùng cho service cần truy cập mạng.
+** Thành viên
+*** Chỉ process chạy dưới tài khoản NT AUTHORITY\NetworkService.
+** Quyền và vai trò
+*** Quyền thấp hơn SYSTEM.
+*** Có thể truy cập mạng dưới danh tính của máy (computer account).
+*** Dùng cho IIS, SQL, DNS… khi cần network nhưng không muốn full SYSTEM.
+
+
+* LS – LOCAL SERVICE
+** Tài khoản service tích hợp, dùng cho service không cần mạng.
+** Thành viên
+*** Chỉ process chạy dưới NT AUTHORITY\LocalService.
+** Quyền và vai trò
+*** Quyền rất thấp (gần như user bình thường).
+*** Không có quyền truy cập mạng.
+*** Dùng để tăng bảo mật cho service (ví dụ: Windows Update, Audio service…).
+
+* BU – BUILTIN\Users
+** Nhóm Người dùng mặc định.
+** Thành viên
+*** Hầu hết tất cả local user accounts (kể cả tài khoản tạo mới).
+*** Không bao gồm Administrator (nếu không được thêm thủ công).
+** Quyền và vai trò
+*** Quyền cơ bản: đọc file hệ thống, chạy chương trình, lưu dữ liệu cá nhân.
+*** Không được cài đặt phần mềm yêu cầu admin.
+
+* PU – BUILTIN\Power Users
+** Nhóm “Người dùng quyền lực” (legacy group từ Windows XP).
+** Thành viên
+*** User được admin thêm vào nhóm này (rất hiếm hiện nay).
+** Quyền và vai trò
+*** Từ Windows Vista trở đi: Không còn quyền đặc biệt nào. Giống hệt BUILTIN\Users.
+*** Trước đây (XP/2003) có quyền cài phần mềm, chia sẻ folder, quản lý Users group… nhưng Microsoft đã xóa hết để tăng bảo mật.
+** Lưu ý: Nhóm này gần như vô dụng hiện nay, chỉ giữ lại vì tương thích cũ.
+
+* SO – BUILTIN\Server Operators
+** Nhóm Quản trị viên Server (chỉ có ý nghĩa trên Domain Controller).
+** Thành viên
+*** Chỉ trên Domain Controller (máy chủ Domain).
+*** Trên máy workstation hoặc member server: nhóm rỗng hoặc không có tác dụng.
+** Quyền và vai trò
+*** Trên DC: backup/restore, shutdown server, quản lý shares, tape drive…
+*** Không có quyền admin đầy đủ như BA.
+** Lưu ý: Hiếm gặp trên máy cá nhân.
+
+
+
+Các nhóm khác trên hệ thống
+Backup Operators
+
+Mô tả: Nhóm chuyên sao lưu và khôi phục dữ liệu.
+Thành viên mặc định: Thường rỗng.
+Quyền:
+Backup và Restore tất cả file/folder (bypass mọi permission trên file).
+Log on locally và shutdown máy.
+
+Lưu ý: Quyền rất mạnh (có thể đọc file admin). Chỉ thêm account dùng cho phần mềm backup (như Windows Backup, Veeam…). Trên workgroup, nhóm này rất hữu ích cho việc sao lưu toàn máy.
+
+7. Performance Monitor Users
+
+Mô tả: Nhóm cho phép xem dữ liệu hiệu suất hệ thống.
+Thành viên mặc định: Thường rỗng.
+Quyền: Đọc Performance Counters (qua Performance Monitor / perfmon.msc), xem CPU, RAM, Disk… mà không cần quyền admin.
+Lưu ý: Rất tiện cho người quản trị theo dõi hiệu suất mà không cho full admin.
+
+8. Event Log Readers
+
+Mô tả: Nhóm cho phép đọc Event Logs (nhật ký hệ thống).
+Thành viên mặc định: Thường rỗng.
+Quyền: Mở Event Viewer và đọc các log (Application, System, Security…) mà không cần quyền admin.
+Lưu ý: Hữu ích khi cần cho support team hoặc monitoring tool đọc log mà không cấp quyền cao.
+
+9. Access Control Assistance Operators
+
+Mô tả: Nhóm hỗ trợ Remote Assistance và kiểm soát truy cập.
+Thành viên mặc định: Thường rỗng.
+Quyền: Cho phép trợ giúp từ xa (Remote Assistance), xem và thay đổi một số permission trên máy.
+Lưu ý: Ít dùng trên máy cá nhân, chủ yếu trong môi trường hỗ trợ IT.
+
+10. Hyper-V Administrators (chỉ có nếu cài Hyper-V)
+
+Mô tả: Nhóm quản trị Hyper-V (ảo hóa).
+Thành viên mặc định: Thường rỗng.
+Quyền: Toàn quyền quản lý Hyper-V: tạo VM, chỉnh sửa setting, snapshot, networking…
+Lưu ý: Chỉ xuất hiện khi bạn bật tính năng Hyper-V. Thành viên có quyền mạnh trên phần ảo hóa nhưng không nhất thiết là full admin máy.
+
+Một số built-in groups khác hay gặp trên workgroup
+
+Distributed COM Users: Cho phép sử dụng DCOM (Distributed Component Object Model) từ xa.
+Network Configuration Operators: Cho phép thay đổi cấu hình mạng (IP, adapter…) mà không cần full admin.
+Cryptographic Operators: Thực hiện một số thao tác mã hóa (ít dùng).
+Replicator: Dùng cho File Replication Service (thường rỗng trên workgroup).
+Print Operators: Quản lý máy in và hàng đợi in (ít phổ biến trên máy cá nhân).
+
+
+
+
+
+
+
+
+* Logon Type
+| Type | Tên               | Ý nghĩa                             |
+| ---- | ----------------- | ----------------------------------- |
+| 2    | Interactive       | Login trực tiếp (console)           |
+| 3    | Network           | Truy cập qua network (SMB, IPC$...) |
+| 4    | Batch             | Task Scheduler                      |
+| 5    | Service           | Windows Service                     |
+| 7    | Unlock            | Unlock workstation                  |
+| 8    | NetworkCleartext  | Network + cleartext password        |
+| 9    | NewCredentials    | `RunAs /netonly`                    |
+| 10   | RemoteInteractive | RDP                                 |
+| 11   | CachedInteractive | Login offline (cached creds)        |
+
+
+* IU
+** IU là viết tắt của Interactive Users (SID: S-1-5-4)
+** Đây không phải là group cố định chứa user, mà là:
+** Cơ chế của Windows (có thể hiểu chung cho các logon type khác)
+*** Một security principal động (dynamic identity) được Windows gán vào access token khi user đăng nhập theo kiểu “interactive”
+*** Khi một user login kiểu “ngồi trước máy” hoặc “remote có GUI” -> token của họ sẽ có thêm: INTERACTIVE (S-1-5-4), Điều này cho phép hệ thống phân biệt:
+**** Người dùng thật sự “đang sử dụng session”
+**** Với các account chạy nền (service, batch, network...)
+
+
+
+| Identity    | SID     | Ý nghĩa              |
+| ----------- | ------- | -------------------- |
+| INTERACTIVE | S-1-5-4 | User có session      |
+| NETWORK     | S-1-5-2 | Truy cập qua network |
+| BATCH       | S-1-5-3 | Task scheduler       |
+| SERVICE     | S-1-5-6 | Service              |
+
+
+* Đối với logon type 9:
+runas /netonly /user:DOMAIN\admin cmd.exe
+-> Không được tính là interactive, vì dùng /netonly chỉ định chỉ dùng credential này cho network, đồng nghĩa nó là network logon, Không authenticate với local machine, Không tạo logon session mới
+
+runas /user:DOMAIN\admin cmd.exe
+-> Được tính là interactive logon, Vì Windows gọi LSASS để authenticate, Tạo logon session mới, Logon Type: 2 (Interactive)
+
+
+
+
+* Vì sao có shell chưa đủ?
+** Có UI / shell: chỉ là thấy cửa sổ cmd.exe
+** Interactive logon thật: Lúc này Windows tạo:
+*** logon session mới
+*** token mới
+*** gán SID INTERACTIVE (S-1-5-4) một cách chính danh
+-> Chỉ B mới là interactive
+
+
+
+
+
+
+
+
+
