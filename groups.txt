@@ -215,6 +215,61 @@ runas /user:DOMAIN\admin cmd.exe
 -> Chỉ B mới là interactive
 
 
+******************************************************
+cần xác định rõ ràng logon type
+
+
+
+
+c:\Users\wintest\Desktop>sc sdshow scmanager
+
+D:(A;;CC;;;AU)(A;;CCLCRPRC;;;IU)(A;;CCLCRPRC;;;SU)(A;;CCLCRPWPRC;;;SY)(A;;KA;;;BA)(A;;CC;;;AC)(A;;CC;;;S-1-15-3-1024-528118966-3876874398-709513571-1907873084-3598227634-3698730060-278077788-3990600205)S:(AU;FA;KA;;;WD)(AU;OIIOFA;GA;;;WD)
+
+
+
+C:\Users\wintest>wmic useraccount where name="normal" get sid
+SID
+S-1-5-21-802152225-4151336390-1700289218-1002
+
+
+C:\Users\wintest>
+
+HKLM\SYSTEM\CurrentControlSet\Control
+RemoteAccessExemption = 1
+
+Hai value trong registry khiến bỏ đi UAC và split token cho user trong group Administrator
+HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+LocalAccountTokenFilterPolicy 
+EnableLUA
+
+
+
+
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\SecurePipeServers\SCM
+RemoteAccessCheckExemptionList type Multi-String Value
+
+
+
+
+command search
+remote service windows disable SCM check
+
+link:
+https://unclesp1d3r.github.io/posts/service-sentinel-mastering-sc-exe-remote-execution-persistence/
+https://www.coretechnologies.com/blog/windows-services/non-admins-control-services-remotely/
+
+
+
+net use * /del
+
+net use \\192.168.17.36\shared /user:test test
+net use \\192.168.17.36\shared /user:normal normal
+net use \\192.168.17.36\shared /user:wintest wintest@123!
+
+sc \\192.168.17.36 create test7 binPath= c:\temp\service.exe
+
+
+
 
 
 
